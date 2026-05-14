@@ -254,6 +254,14 @@ async fn v1_responses(
         .await
 }
 
+async fn v1_responses_ws(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    req: Request,
+) -> Response {
+    state.router.route_responses_ws(req, tenant_meta).await
+}
+
 async fn v1_interactions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -879,6 +887,21 @@ pub fn build_app(
             middleware::auth_middleware,
         ));
 
+    let responses_ws_routes = Router::new()
+        .route("/v1/responses", get(v1_responses_ws))
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::concurrency_limit_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            tenant_resolution_state.clone(),
+            middleware::route_request_meta_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            middleware::auth_middleware,
+        ));
+
     // Multipart upload routes: auth + concurrency but NO WASM middleware.
     // The WASM OnRequest phase buffers the full body into a `Vec<u8>` subject
     // to the WASM manager's `max_body_size` (10MB default). Audio uploads
@@ -998,6 +1021,7 @@ pub fn build_app(
     Ok(Router::new()
         .merge(protected_routes)
         .merge(realtime_routes)
+        .merge(responses_ws_routes)
         .merge(multipart_upload_routes)
         .merge(public_routes)
         .merge(admin_routes)

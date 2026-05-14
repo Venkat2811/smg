@@ -27,6 +27,7 @@ use crate::{
         common::{openai_bridge, persistence_utils::split_stored_message_content},
         error,
         grpc::common::responses::ResponsesContext,
+        ws_responses::CachedWsResponse,
     },
 };
 
@@ -45,7 +46,7 @@ pub(super) struct ToolLoopState {
 
 /// Per-request parameters for chat pipeline execution.
 /// Bundles values that are always threaded together through the regular responses call chain.
-pub(super) struct ResponsesCallContext {
+pub(crate) struct ResponsesCallContext {
     pub headers: Option<http::HeaderMap>,
     pub model_id: String,
     pub response_id: Option<String>,
@@ -167,70 +168,85 @@ pub(super) async fn load_conversation_history(
     ctx: &ResponsesContext,
     request: &ResponsesRequest,
 ) -> Result<ResponsesRequest, Response> {
+    load_conversation_history_with_cache(ctx, request, None, false).await
+}
+
+pub(crate) async fn load_conversation_history_with_cache(
+    ctx: &ResponsesContext,
+    request: &ResponsesRequest,
+    cached_response: Option<&CachedWsResponse>,
+    strict_missing_previous: bool,
+) -> Result<ResponsesRequest, Response> {
     let mut modified_request = request.clone();
     let mut conversation_items: Option<Vec<ResponseInputOutputItem>> = None;
 
     // Handle previous_response_id by loading response chain
     if let Some(ref prev_id_str) = modified_request.previous_response_id {
-        let prev_id = ResponseId::from(prev_id_str.as_str());
-        match ctx
-            .response_storage
-            .get_response_chain(&prev_id, None)
-            .await
-        {
-            Ok(chain) if !chain.responses.is_empty() => {
-                let mut items = Vec::new();
-                for stored in &chain.responses {
-                    // Convert input items from stored input (which is now a JSON array)
-                    if let Some(input_arr) = stored.input.as_array() {
-                        for item in input_arr {
-                            match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
-                                Ok(input_item) => {
-                                    items.push(input_item);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to deserialize stored input item: {}. Item: {}",
-                                        e, item
-                                    );
+        if let Some(cached_response) = cached_response.filter(|cached| {
+            cached.response.id == *prev_id_str
+                && cached.response.status != responses::ResponseStatus::Failed
+        }) {
+            conversation_items = Some(cached_response.to_conversation_items());
+            modified_request.previous_response_id = None;
+        } else {
+            let prev_id = ResponseId::from(prev_id_str.as_str());
+            match ctx
+                .response_storage
+                .get_response_chain(&prev_id, None)
+                .await
+            {
+                Ok(chain) if !chain.responses.is_empty() => {
+                    let mut items = Vec::new();
+                    for stored in &chain.responses {
+                        if let Some(input_arr) = stored.input.as_array() {
+                            for item in input_arr {
+                                match serde_json::from_value::<ResponseInputOutputItem>(
+                                    item.clone(),
+                                ) {
+                                    Ok(input_item) => items.push(input_item),
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to deserialize stored input item: {}. Item: {}",
+                                            e, item
+                                        );
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    // Convert output items from stored raw_response["output"] (which is a JSON array)
-                    if let Some(output_arr) =
-                        stored.raw_response.get("output").and_then(|v| v.as_array())
-                    {
-                        for item in output_arr {
-                            match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
-                                Ok(output_item) => {
-                                    items.push(output_item);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to deserialize stored output item: {}. Item: {}",
-                                        e, item
-                                    );
+                        if let Some(output_arr) =
+                            stored.raw_response.get("output").and_then(|v| v.as_array())
+                        {
+                            for item in output_arr {
+                                match serde_json::from_value::<ResponseInputOutputItem>(
+                                    item.clone(),
+                                ) {
+                                    Ok(output_item) => items.push(output_item),
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to deserialize stored output item: {}. Item: {}",
+                                            e, item
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
+                    conversation_items = Some(items);
+                    modified_request.previous_response_id = None;
                 }
-                conversation_items = Some(items);
-                modified_request.previous_response_id = None;
-            }
-            Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => {
-                return Err(error::bad_request(
-                    "previous_response_not_found",
-                    format!("Previous response with id '{prev_id_str}' not found."),
-                ));
-            }
-            Err(e) => {
-                return Err(error::internal_error(
-                    "load_previous_response_chain_failed",
-                    format!("Failed to load previous response chain for {prev_id_str}: {e}"),
-                ));
+                Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => {
+                    return Err(missing_previous_response_response(
+                        prev_id_str,
+                        strict_missing_previous,
+                    ));
+                }
+                Err(e) => {
+                    return Err(error::internal_error(
+                        "load_previous_response_chain_failed",
+                        format!("Failed to load previous response chain for {prev_id_str}: {e}"),
+                    ));
+                }
             }
         }
     }
@@ -360,6 +376,40 @@ pub(super) async fn load_conversation_history(
     );
 
     Ok(modified_request)
+}
+
+fn missing_previous_response_response(
+    previous_response_id: &str,
+    strict_missing_previous: bool,
+) -> Response {
+    let message = if strict_missing_previous {
+        format!(
+            "Previous response '{}' was not found in the current session or durable storage.",
+            previous_response_id
+        )
+    } else {
+        format!("Previous response '{previous_response_id}' not found.")
+    };
+
+    error::not_found("previous_response_not_found", message)
+}
+
+pub(crate) fn normalize_request_input_items(
+    request: &ResponsesRequest,
+) -> Vec<ResponseInputOutputItem> {
+    match &request.input {
+        ResponseInput::Text(text) => vec![ResponseInputOutputItem::Message {
+            id: format!(
+                "msg_u_{}",
+                request.previous_response_id.as_deref().unwrap_or("new")
+            ),
+            role: "user".to_string(),
+            content: vec![ResponseContentPart::InputText { text: text.clone() }],
+            status: Some("completed".to_string()),
+            phase: None,
+        }],
+        ResponseInput::Items(items) => items.iter().map(responses::normalize_input_item).collect(),
+    }
 }
 
 /// Build next request with updated conversation history

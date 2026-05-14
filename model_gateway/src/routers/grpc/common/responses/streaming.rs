@@ -1,6 +1,6 @@
 //! Streaming infrastructure for /v1/responses endpoint
 
-use axum::{body::Body, http::StatusCode, response::Response};
+use axum::{body::Body, extract::ws::Message, http::StatusCode, response::Response};
 use bytes::Bytes;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use openai_protocol::{
@@ -25,6 +25,114 @@ use crate::routers::{
     common::openai_bridge::{self, descriptor, ResponseFormat},
     grpc::harmony::responses::ToolResult,
 };
+
+pub(crate) trait ResponseEventSink {
+    fn send_event(&self, event: &serde_json::Value) -> Result<(), String>;
+    fn send_raw_json(&self, payload: &str) -> Result<(), String>;
+    fn send_done(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SseResponseEventSink {
+    tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+}
+
+impl SseResponseEventSink {
+    pub fn new(tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>) -> Self {
+        Self { tx }
+    }
+}
+
+impl ResponseEventSink for SseResponseEventSink {
+    fn send_event(&self, event: &serde_json::Value) -> Result<(), String> {
+        let event_json =
+            serde_json::to_string(event).map_err(|e| format!("Failed to serialize event: {e}"))?;
+
+        let event_type = event
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("message");
+        let sse_message = format!("event: {event_type}\ndata: {event_json}\n\n");
+
+        if self.tx.send(Ok(Bytes::from(sse_message))).is_err() {
+            return Err("Client disconnected".to_string());
+        }
+
+        Ok(())
+    }
+
+    fn send_raw_json(&self, payload: &str) -> Result<(), String> {
+        if self
+            .tx
+            .send(Ok(Bytes::from(format!("data: {payload}\n\n"))))
+            .is_err()
+        {
+            return Err("Client disconnected".to_string());
+        }
+
+        Ok(())
+    }
+
+    fn send_done(&self) -> Result<(), String> {
+        if self.tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).is_err() {
+            return Err("Client disconnected".to_string());
+        }
+
+        Ok(())
+    }
+}
+
+impl ResponseEventSink for mpsc::UnboundedSender<Result<Bytes, std::io::Error>> {
+    fn send_event(&self, event: &serde_json::Value) -> Result<(), String> {
+        SseResponseEventSink::new(self.clone()).send_event(event)
+    }
+
+    fn send_raw_json(&self, payload: &str) -> Result<(), String> {
+        SseResponseEventSink::new(self.clone()).send_raw_json(payload)
+    }
+
+    fn send_done(&self) -> Result<(), String> {
+        SseResponseEventSink::new(self.clone()).send_done()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct WsResponseEventSink {
+    tx: mpsc::Sender<Message>,
+}
+
+impl WsResponseEventSink {
+    pub fn new(tx: mpsc::Sender<Message>) -> Self {
+        Self { tx }
+    }
+}
+
+impl ResponseEventSink for WsResponseEventSink {
+    fn send_event(&self, event: &serde_json::Value) -> Result<(), String> {
+        let event_json =
+            serde_json::to_string(event).map_err(|e| format!("Failed to serialize event: {e}"))?;
+
+        if self.tx.try_send(Message::Text(event_json.into())).is_err() {
+            return Err("Client disconnected or outbound buffer full".to_string());
+        }
+
+        Ok(())
+    }
+
+    fn send_raw_json(&self, payload: &str) -> Result<(), String> {
+        if self
+            .tx
+            .try_send(Message::Text(payload.to_string().into()))
+            .is_err()
+        {
+            return Err("Client disconnected or outbound buffer full".to_string());
+        }
+
+        Ok(())
+    }
+}
 
 /// Item-id-prefix discriminator for non-format kinds. Format-driven items
 /// derive their prefix from `descriptor(format).id_prefix` instead — keeping
@@ -273,16 +381,18 @@ impl ResponseStreamEventEmitter {
         })
     }
 
-    // INVARIANT: this method is terminal — it drains internal state via `take()`
-    // and must only be called once per emitter lifetime.
-    pub fn emit_completed(&mut self, usage: Option<&serde_json::Value>) -> serde_json::Value {
+    pub fn emit_completed_with_status(
+        &mut self,
+        status: ResponseStatus,
+        usage: Option<&serde_json::Value>,
+    ) -> serde_json::Value {
         // Build output array from tracked items
         let output: Vec<serde_json::Value> = self
             .output_items
-            .iter_mut()
+            .iter()
             .filter_map(|item| {
                 if item.status == ItemStatus::Completed {
-                    item.item_data.take()
+                    item.item_data.clone()
                 } else {
                     None
                 }
@@ -292,13 +402,14 @@ impl ResponseStreamEventEmitter {
         // If no items were tracked (legacy path), fall back to generic message
         let output = if output.is_empty() {
             vec![json!({
-                "id": std::mem::take(&mut self.message_id),
+                "id": self.message_id.clone(),
                 "type": "message",
                 "role": "assistant",
                 "content": [{
                     "type": "output_text",
-                    "text": std::mem::take(&mut self.accumulated_text)
-                }]
+                    "text": self.accumulated_text.clone()
+                }],
+                "status": "completed"
             })]
         } else {
             output
@@ -309,7 +420,7 @@ impl ResponseStreamEventEmitter {
             "id": self.response_id,
             "object": "response",
             "created_at": self.created_at,
-            "status": "completed",
+            "status": status,
             "model": self.model,
             "output": output
         });
@@ -363,6 +474,10 @@ impl ResponseStreamEventEmitter {
             "sequence_number": self.next_sequence(),
             "response": response_obj
         })
+    }
+
+    pub fn emit_completed(&mut self, usage: Option<&serde_json::Value>) -> serde_json::Value {
+        self.emit_completed_with_status(ResponseStatus::Completed, usage)
     }
 
     /// Convert tool entries to JSON values using the shared bridge builder.
@@ -672,13 +787,16 @@ impl ResponseStreamEventEmitter {
         }
     }
 
-    /// Finalize and return the complete ResponsesResponse
+    /// Finalize and return the complete ResponsesResponse with an explicit status.
     ///
-    /// This constructs the final ResponsesResponse from all accumulated output items
-    /// for persistence. Should be called after streaming is complete.
-    /// Reads non-destructively so `emit_completed()` can still drain state afterwards.
-    pub fn finalize(&self, usage: Option<Usage>) -> ResponsesResponse {
-        // Build output array from tracked items (clone — emit_completed drains later)
+    /// This constructs the final `ResponsesResponse` from all accumulated output
+    /// items for persistence and WS cache updates.
+    pub fn finalize_with_status(
+        &self,
+        usage: Option<Usage>,
+        status: ResponseStatus,
+    ) -> ResponsesResponse {
+        // Build output array from tracked items
         let output: Vec<ResponseOutputItem> = self
             .output_items
             .iter()
@@ -707,11 +825,16 @@ impl ResponseStreamEventEmitter {
         // Build response using builder
         ResponsesResponse::builder(&self.response_id, &self.model)
             .created_at(self.created_at as i64)
-            .status(ResponseStatus::Completed)
+            .status(status)
             .output(output)
             .maybe_copy_from_request(self.original_request.as_ref())
             .maybe_usage(responses_usage)
             .build()
+    }
+
+    /// Finalize and return the complete `ResponsesResponse`.
+    pub fn finalize(&self, usage: Option<Usage>) -> ResponsesResponse {
+        self.finalize_with_status(usage, ResponseStatus::Completed)
     }
 
     /// Emit reasoning item wrapper events (added + done)
@@ -720,7 +843,7 @@ impl ResponseStreamEventEmitter {
     /// They don't have streaming content - just wrapper events with empty/null content.
     pub fn emit_reasoning_item(
         &mut self,
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        sink: &impl ResponseEventSink,
         reasoning_content: Option<String>,
     ) -> Result<(), String> {
         // Allocate output index and generate ID
@@ -738,11 +861,11 @@ impl ResponseStreamEventEmitter {
 
         // Emit output_item.added
         let added_event = self.emit_output_item_added(output_index, &item);
-        self.send_event(&added_event, tx)?;
+        self.send_event(&added_event, sink)?;
 
         // Immediately emit output_item.done (no streaming for reasoning)
         let done_event = self.emit_output_item_done(output_index, &item);
-        self.send_event(&done_event, tx)?;
+        self.send_event(&done_event, sink)?;
 
         // Mark as completed
         self.complete_output_item(output_index);
@@ -754,7 +877,7 @@ impl ResponseStreamEventEmitter {
     pub fn process_chunk(
         &mut self,
         chunk: &ChatCompletionStreamResponse,
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        sink: &impl ResponseEventSink,
     ) -> Result<(), String> {
         // Process content if present
         if let Some(choice) = chunk.choices.first() {
@@ -775,7 +898,7 @@ impl ResponseStreamEventEmitter {
 
                         // Emit output_item.added
                         let event = self.emit_output_item_added(output_index, &item);
-                        self.send_event(&event, tx)?;
+                        self.send_event(&event, sink)?;
                         self.has_emitted_output_item_added = true;
 
                         // Store for subsequent events
@@ -795,14 +918,14 @@ impl ResponseStreamEventEmitter {
                         if !self.has_emitted_content_part_added {
                             let event =
                                 self.emit_content_part_added(output_index, &item_id, content_index);
-                            self.send_event(&event, tx)?;
+                            self.send_event(&event, sink)?;
                             self.has_emitted_content_part_added = true;
                         }
 
                         // Emit text delta
                         let event =
                             self.emit_text_delta(content, output_index, &item_id, content_index);
-                        self.send_event(&event, tx)?;
+                        self.send_event(&event, sink)?;
                     }
                 }
             }
@@ -819,10 +942,10 @@ impl ResponseStreamEventEmitter {
                         // Emit closing events
                         if self.has_emitted_content_part_added {
                             let event = self.emit_text_done(output_index, &item_id, content_index);
-                            self.send_event(&event, tx)?;
+                            self.send_event(&event, sink)?;
                             let event =
                                 self.emit_content_part_done(output_index, &item_id, content_index);
-                            self.send_event(&event, tx)?;
+                            self.send_event(&event, sink)?;
                         }
 
                         if self.has_emitted_output_item_added {
@@ -834,10 +957,11 @@ impl ResponseStreamEventEmitter {
                                 "content": [{
                                     "type": "output_text",
                                     "text": std::mem::take(&mut self.accumulated_text)
-                                }]
+                                }],
+                                "status": "completed"
                             });
                             let event = self.emit_output_item_done(output_index, &item);
-                            self.send_event(&event, tx)?;
+                            self.send_event(&event, sink)?;
                         }
 
                         // Mark item as completed
@@ -857,25 +981,9 @@ impl ResponseStreamEventEmitter {
     pub fn send_event(
         &self,
         event: &serde_json::Value,
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        sink: &impl ResponseEventSink,
     ) -> Result<(), String> {
-        let event_json =
-            serde_json::to_string(event).map_err(|e| format!("Failed to serialize event: {e}"))?;
-
-        // Extract event type from the JSON for SSE event field
-        let event_type = event
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("message");
-
-        // Format as SSE with event: field
-        let sse_message = format!("event: {event_type}\ndata: {event_json}\n\n");
-
-        if tx.send(Ok(Bytes::from(sse_message))).is_err() {
-            return Err("Client disconnected".to_string());
-        }
-
-        Ok(())
+        sink.send_event(event)
     }
 
     /// Send event and log any errors (typically client disconnect)
@@ -886,9 +994,9 @@ impl ResponseStreamEventEmitter {
     pub fn send_event_best_effort(
         &self,
         event: &serde_json::Value,
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        sink: &impl ResponseEventSink,
     ) -> bool {
-        match self.send_event(event, tx) {
+        match self.send_event(event, sink) {
             Ok(()) => true,
             Err(e) => {
                 tracing::debug!("Failed to send event (likely client disconnect): {}", e);
@@ -906,7 +1014,7 @@ impl ResponseStreamEventEmitter {
         &mut self,
         error_msg: &str,
         error_code: Option<&str>,
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        sink: &impl ResponseEventSink,
     ) {
         let event = json!({
             "type": "error",
@@ -915,11 +1023,10 @@ impl ResponseStreamEventEmitter {
             "param": null,
             "sequence_number": self.next_sequence()
         });
-        let sse_data = match serde_json::to_string(&event) {
-            Ok(json) => format!("data: {json}\n\n"),
-            Err(_) => "data: {\"type\":\"error\",\"code\":\"internal_error\",\"message\":\"serialization failed\",\"param\":null}\n\n".to_string(),
-        };
-        let _ = tx.send(Ok(Bytes::from(sse_data)));
+        let payload = serde_json::to_string(&event).unwrap_or_else(|_| {
+            "{\"type\":\"error\",\"code\":\"internal_error\",\"message\":\"serialization failed\",\"param\":null}".to_string()
+        });
+        let _ = sink.send_raw_json(&payload);
     }
 
     /// Emit the full mcp_list_tools output-item sequence.
@@ -934,7 +1041,7 @@ impl ResponseStreamEventEmitter {
         &mut self,
         server_label: &str,
         tools: &[mcp::ToolEntry],
-        tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+        sink: &impl ResponseEventSink,
     ) -> Result<(), String> {
         let (output_index, item_id) = self.allocate_output_index(OutputItemKind::McpListTools);
 
@@ -955,15 +1062,15 @@ impl ResponseStreamEventEmitter {
 
         // Emit output_item.added
         let event = self.emit_output_item_added(output_index, &item_in_progress);
-        self.send_event(&event, tx)?;
+        self.send_event(&event, sink)?;
 
         // Emit mcp_list_tools.in_progress
         let event = self.emit_mcp_list_tools_in_progress(output_index);
-        self.send_event(&event, tx)?;
+        self.send_event(&event, sink)?;
 
         // Emit mcp_list_tools.completed
         let event = self.emit_mcp_list_tools_completed(output_index, &tool_items);
-        self.send_event(&event, tx)?;
+        self.send_event(&event, sink)?;
 
         // Completed item (with tools populated)
         let item_done = json!({
@@ -976,7 +1083,7 @@ impl ResponseStreamEventEmitter {
 
         // Emit output_item.done (also stores item data internally)
         let event = self.emit_output_item_done(output_index, &item_done);
-        self.send_event(&event, tx)?;
+        self.send_event(&event, sink)?;
 
         self.complete_output_item(output_index);
 

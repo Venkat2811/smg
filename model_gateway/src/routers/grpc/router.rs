@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{
+    extract::ws::Message,
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
@@ -29,6 +30,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
         common::retry::{is_retryable_status, RetryExecutor},
+        ws_responses::{CachedWsResponse, WsClientError, WsResponseCreateOptions},
         RouterTrait,
     },
     worker::WorkerRegistry,
@@ -574,6 +576,28 @@ impl RouterTrait for GrpcRouter {
         model_id: &str,
     ) -> Response {
         self.route_responses_impl(headers, tenant_meta, body, model_id)
+            .await
+    }
+
+    async fn execute_responses_ws_create(
+        &self,
+        headers: HeaderMap,
+        tenant_meta: &TenantRequestMeta,
+        request: ResponsesRequest,
+        options: WsResponseCreateOptions,
+        cached_response: Option<CachedWsResponse>,
+        outbound_tx: tokio::sync::mpsc::Sender<Message>,
+    ) -> Result<CachedWsResponse, WsClientError> {
+        let executor = responses::GrpcWsResponsesExecutor::new(
+            self.worker_registry.clone(),
+            self.responses_context.clone(),
+            tenant_meta.clone(),
+        );
+
+        use crate::routers::ws_responses::WsResponsesExecutor;
+
+        executor
+            .execute_response_create(headers, request, options, cached_response, outbound_tx)
             .await
     }
 

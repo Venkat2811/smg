@@ -9,7 +9,7 @@ use std::{collections::HashSet, sync::Arc};
 use async_trait::async_trait;
 use axum::{
     body::Body,
-    extract::Request,
+    extract::{ws::Message, FromRequestParts, Request},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -51,6 +51,10 @@ use crate::{
         common::header_utils::apply_provider_headers,
         error as route_error,
         factory::{router_ids, RouterId},
+        ws_responses::{
+            serve_responses_ws, CachedWsResponse, WsClientError, WsResponseCreateOptions,
+            WsResponsesExecutor,
+        },
         RouterFactory, RouterTrait,
     },
     server::ServerConfig,
@@ -65,6 +69,73 @@ pub struct RouterManager {
     default_router: Arc<std::sync::RwLock<Option<RouterId>>>,
     skill_service: Option<Arc<SkillService>>,
     enable_igw: bool,
+}
+
+#[derive(Clone)]
+struct ManagerWsResponsesExecutor {
+    routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
+    default_router: Arc<std::sync::RwLock<Option<RouterId>>>,
+    enable_igw: bool,
+    tenant_meta: TenantRequestMeta,
+}
+
+impl ManagerWsResponsesExecutor {
+    fn select_ws_router(&self) -> Option<Arc<dyn RouterTrait>> {
+        if self.enable_igw {
+            return self
+                .routers
+                .get(&router_ids::GRPC_REGULAR)
+                .map(|router| router.clone())
+                .or_else(|| {
+                    let default_router = self
+                        .default_router
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner());
+                    default_router
+                        .as_ref()
+                        .and_then(|default_id| self.routers.get(default_id).map(|r| r.clone()))
+                });
+        }
+
+        let default_router = self
+            .default_router
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        default_router
+            .as_ref()
+            .and_then(|default_id| self.routers.get(default_id).map(|r| r.clone()))
+    }
+}
+
+#[async_trait]
+impl WsResponsesExecutor for ManagerWsResponsesExecutor {
+    async fn execute_response_create(
+        &self,
+        headers: HeaderMap,
+        request: ResponsesRequest,
+        options: WsResponseCreateOptions,
+        cached_response: Option<CachedWsResponse>,
+        outbound_tx: tokio::sync::mpsc::Sender<Message>,
+    ) -> Result<CachedWsResponse, WsClientError> {
+        let Some(router) = self.select_ws_router() else {
+            return Err(WsClientError::new(
+                "no_router_available",
+                "No router available for websocket responses request.",
+            )
+            .with_status(StatusCode::NOT_FOUND.as_u16()));
+        };
+
+        router
+            .execute_responses_ws_create(
+                headers,
+                &self.tenant_meta,
+                request,
+                options,
+                cached_response,
+                outbound_tx,
+            )
+            .await
+    }
 }
 
 impl RouterManager {
@@ -865,6 +936,33 @@ impl RouterTrait for RouterManager {
             )
                 .into_response()
         }
+    }
+
+    async fn route_responses_ws(
+        &self,
+        req: Request<Body>,
+        tenant_meta: TenantRequestMeta,
+    ) -> Response {
+        let (mut parts, _body) = req.into_parts();
+        let headers = parts.headers.clone();
+
+        let ws =
+            match axum::extract::ws::WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+                Ok(ws) => ws,
+                Err(err) => return err.into_response(),
+            };
+
+        let executor = Arc::new(ManagerWsResponsesExecutor {
+            routers: self.routers.clone(),
+            default_router: self.default_router.clone(),
+            enable_igw: self.enable_igw,
+            tenant_meta,
+        });
+
+        ws.on_upgrade(move |socket| async move {
+            serve_responses_ws(socket, headers, executor).await;
+        })
+        .into_response()
     }
 
     async fn route_realtime_webrtc(&self, req: Request<Body>, model: &str) -> Response {

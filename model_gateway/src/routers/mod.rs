@@ -5,6 +5,7 @@ use std::fmt::Debug;
 use async_trait::async_trait;
 use axum::{
     body::Body,
+    extract::ws::Message,
     extract::Request,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -27,6 +28,8 @@ use openai_protocol::{
 };
 
 use crate::middleware::TenantRequestMeta;
+use crate::routers::ws_responses::{CachedWsResponse, WsClientError, WsResponseCreateOptions};
+use tokio::sync::mpsc;
 
 pub mod anthropic;
 pub mod common;
@@ -39,9 +42,11 @@ pub mod http;
 pub mod openai;
 pub mod parse;
 pub mod responses;
+pub mod responses_validation;
 pub mod router_manager;
 pub mod skills;
 pub mod tokenize;
+pub mod ws_responses;
 
 pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience
@@ -142,6 +147,36 @@ pub trait RouterTrait: Send + Sync + Debug {
             "Responses endpoint not implemented",
         )
             .into_response()
+    }
+
+    /// Route a Responses WebSocket upgrade request (`GET /v1/responses`)
+    async fn route_responses_ws(
+        &self,
+        _req: Request<Body>,
+        _tenant_meta: TenantRequestMeta,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Responses WebSocket not implemented",
+        )
+            .into_response()
+    }
+
+    /// Execute a `response.create` message on an already-upgraded Responses socket.
+    async fn execute_responses_ws_create(
+        &self,
+        _headers: HeaderMap,
+        _tenant_meta: &TenantRequestMeta,
+        _request: ResponsesRequest,
+        _options: WsResponseCreateOptions,
+        _cached_response: Option<CachedWsResponse>,
+        _outbound_tx: mpsc::Sender<Message>,
+    ) -> Result<CachedWsResponse, WsClientError> {
+        Err(WsClientError::new(
+            "unsupported_parameter",
+            "Responses WebSocket is not implemented for this router.",
+        )
+        .with_status(StatusCode::NOT_IMPLEMENTED.as_u16()))
     }
 
     /// Cancel a background response by id
