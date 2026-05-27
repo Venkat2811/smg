@@ -779,6 +779,7 @@ pub enum ToolChoice {
 // ============================================================================
 
 /// Configuration for extended thinking
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThinkingConfig {
@@ -786,9 +787,27 @@ pub enum ThinkingConfig {
     Enabled {
         /// Budget in tokens for thinking (minimum 1024)
         budget_tokens: u32,
+        /// How thinking content is returned in the response.
+        display: Option<ThinkingDisplay>,
     },
     /// Disable extended thinking
     Disabled,
+    /// Let the model decide when and how much to think. Required on Opus 4.7.
+    Adaptive {
+        /// How thinking content is returned in the response.
+        /// Defaults vary by model (Opus 4.7 / Mythos default to `Omitted`; others to `Summarized`).
+        display: Option<ThinkingDisplay>,
+    },
+}
+
+/// How thinking content is returned in API responses
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplay {
+    /// Thinking blocks contain summarized reasoning text
+    Summarized,
+    /// Thinking blocks return empty text; signature still carries encrypted content
+    Omitted,
 }
 
 // ============================================================================
@@ -2179,6 +2198,87 @@ mod tests {
         request.mcp_servers = Some(vec![mcp_server_config()]);
 
         assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn test_thinking_config_adaptive_minimal() {
+        let cfg: ThinkingConfig = serde_json::from_str(r#"{"type":"adaptive"}"#).unwrap();
+        match cfg {
+            ThinkingConfig::Adaptive { display } => assert_eq!(display, None),
+            other => panic!("expected Adaptive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_thinking_config_adaptive_with_display() {
+        let cfg: ThinkingConfig =
+            serde_json::from_str(r#"{"type":"adaptive","display":"omitted"}"#).unwrap();
+        match cfg {
+            ThinkingConfig::Adaptive { display } => {
+                assert_eq!(display, Some(ThinkingDisplay::Omitted));
+            }
+            other => panic!("expected Adaptive, got {other:?}"),
+        }
+
+        let cfg: ThinkingConfig =
+            serde_json::from_str(r#"{"type":"adaptive","display":"summarized"}"#).unwrap();
+        match cfg {
+            ThinkingConfig::Adaptive { display } => {
+                assert_eq!(display, Some(ThinkingDisplay::Summarized));
+            }
+            other => panic!("expected Adaptive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_thinking_config_adaptive_round_trip_omits_null_display() {
+        let cfg = ThinkingConfig::Adaptive { display: None };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(json, r#"{"type":"adaptive"}"#);
+    }
+
+    #[test]
+    fn test_thinking_config_existing_variants_still_work() {
+        let cfg: ThinkingConfig =
+            serde_json::from_str(r#"{"type":"enabled","budget_tokens":1024}"#).unwrap();
+        assert!(matches!(
+            cfg,
+            ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+                display: None
+            }
+        ));
+
+        let cfg: ThinkingConfig = serde_json::from_str(r#"{"type":"disabled"}"#).unwrap();
+        assert!(matches!(cfg, ThinkingConfig::Disabled));
+    }
+
+    #[test]
+    fn test_thinking_config_enabled_with_display() {
+        let cfg: ThinkingConfig = serde_json::from_str(
+            r#"{"type":"enabled","budget_tokens":2048,"display":"summarized"}"#,
+        )
+        .unwrap();
+        match cfg {
+            ThinkingConfig::Enabled {
+                budget_tokens,
+                display,
+            } => {
+                assert_eq!(budget_tokens, 2048);
+                assert_eq!(display, Some(ThinkingDisplay::Summarized));
+            }
+            other => panic!("expected Enabled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_thinking_config_enabled_round_trip_omits_null_display() {
+        let cfg = ThinkingConfig::Enabled {
+            budget_tokens: 1024,
+            display: None,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(json, r#"{"type":"enabled","budget_tokens":1024}"#);
     }
 
     #[test]
