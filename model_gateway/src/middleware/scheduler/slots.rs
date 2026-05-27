@@ -84,6 +84,31 @@ impl SlotPool {
         unpack(self.inflight_packed.load(Ordering::Acquire))[class as usize]
     }
 
+    /// Current total backend capacity. Read by `try_acquire` on every
+    /// admission attempt.
+    pub fn capacity(&self) -> u16 {
+        self.capacity.load(Ordering::Acquire)
+    }
+
+    /// Update the total backend capacity. Returns the previous value.
+    /// Called by the scheduler when the WorkerCapacity watch channel
+    /// signals a change.
+    pub fn set_capacity(&self, new_capacity: u16) -> u16 {
+        self.capacity.swap(new_capacity, Ordering::AcqRel)
+    }
+
+    /// Reservation held by `class`.
+    pub fn reserved(&self, class: Class) -> u16 {
+        self.reserved[class as usize].load(Ordering::Acquire)
+    }
+
+    /// Update the reservation held by `class`. Used by the scheduler's
+    /// capacity-shrink path to scale reservations down proportionally
+    /// when `Σ reserved` would otherwise exceed the new capacity.
+    pub fn set_reserved(&self, class: Class, new_reserved: u16) {
+        self.reserved[class as usize].store(new_reserved, Ordering::Release);
+    }
+
     fn snapshot_reserved(&self) -> [u16; 4] {
         [
             self.reserved[0].load(Ordering::Relaxed),
@@ -97,12 +122,18 @@ impl SlotPool {
     /// `false` if `class` has no headroom under the reservation guard.
     /// Bounded loop — re-reads on each failed CAS and exits as soon as
     /// the slot is genuinely full.
+    ///
+    /// `capacity` and the reservation snapshot are re-read on every
+    /// iteration so a live `set_capacity` / `set_reserved` from the
+    /// dispatcher can't be missed mid-retry. Otherwise a long-running
+    /// contention loop could commit against the stale pre-shrink
+    /// ceiling.
     pub fn try_acquire(&self, class: Class) -> bool {
         let lane = class as usize;
-        let capacity = self.capacity.load(Ordering::Acquire);
-        let reserved = self.snapshot_reserved();
         let mut cur = self.inflight_packed.load(Ordering::Acquire);
         loop {
+            let capacity = self.capacity.load(Ordering::Acquire);
+            let reserved = self.snapshot_reserved();
             let mut counts = unpack(cur);
             if slots_available_to(counts, reserved, capacity, class) == 0 {
                 return false;
@@ -125,11 +156,14 @@ impl SlotPool {
     /// ceiling applies. Used by the dispatcher's starvation override so
     /// a starved low-class waiter can consume a reserved-but-unused slot
     /// rather than wait indefinitely.
+    ///
+    /// As with `try_acquire`, `capacity` is re-read every iteration so
+    /// the loop honors live `set_capacity` updates mid-retry.
     pub fn try_acquire_ignoring_reservations(&self, class: Class) -> bool {
         let lane = class as usize;
-        let capacity = self.capacity.load(Ordering::Acquire);
         let mut cur = self.inflight_packed.load(Ordering::Acquire);
         loop {
+            let capacity = self.capacity.load(Ordering::Acquire);
             let mut counts = unpack(cur);
             let used_total: u16 = counts.iter().copied().fold(0, u16::saturating_add);
             if used_total >= capacity {
@@ -289,6 +323,36 @@ mod tests {
         assert!(
             pool.try_acquire_ignoring_reservations(Class::Bulk),
             "starvation-override path bypasses the reservation guard"
+        );
+    }
+
+    #[test]
+    fn test_try_acquire_honors_live_capacity_shrink() {
+        // Pre-fill, then shrink below the current inflight count. Any
+        // subsequent try_acquire must refuse on first iteration because
+        // the loop re-reads capacity (this would have committed against
+        // the old larger ceiling if capacity were cached pre-loop).
+        let pool = SlotPool::new(100, [0, 0, 0, 0]);
+        for _ in 0..50 {
+            assert!(pool.try_acquire(Class::Default));
+        }
+        pool.set_capacity(40); // used_total (50) > new capacity (40)
+        assert!(
+            !pool.try_acquire(Class::Default),
+            "must refuse against the new (lower) capacity"
+        );
+    }
+
+    #[test]
+    fn test_try_acquire_ignoring_reservations_honors_live_capacity_shrink() {
+        let pool = SlotPool::new(100, [0, 0, 0, 0]);
+        for _ in 0..50 {
+            assert!(pool.try_acquire_ignoring_reservations(Class::Bulk));
+        }
+        pool.set_capacity(40);
+        assert!(
+            !pool.try_acquire_ignoring_reservations(Class::Bulk),
+            "starvation-override acquire must also honor the new capacity"
         );
     }
 
