@@ -19,7 +19,7 @@ use tracing::{debug, error, warn};
 
 use super::mcp::{IterationResult, McpToolCall};
 use crate::routers::{
-    common::sse::{SseDecodeError, SseDecoder, SseFrame},
+    common::sse::{SseDecodeError, SseDecoder, SseEncodeError, SseEncoder, SseFrame},
     error::internal_error,
 };
 
@@ -97,21 +97,29 @@ pub(crate) fn build_sse_response(
 /// Returns `true` if the send succeeded, `false` if the receiver was dropped.
 pub(crate) async fn send_event(
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    enc: &mut SseEncoder,
     event_type: &str,
     data: &Value,
 ) -> bool {
-    let bytes = format_sse_event(event_type, data);
+    let bytes = format_sse_event(enc, event_type, data);
     tx.send(Ok(bytes)).await.is_ok()
 }
 
 /// Format a `MessageStreamEvent` as SSE bytes: `event: <type>\ndata: <json>\n\n`
-fn format_sse_event(event_type: &str, data: &Value) -> Bytes {
-    let json = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string());
-    Bytes::from(format!("event: {event_type}\ndata: {json}\n\n"))
+fn format_sse_event(enc: &mut SseEncoder, event_type: &str, data: &Value) -> Bytes {
+    enc.encode_event(event_type, data)
+        .unwrap_or_else(|e| match e {
+            SseEncodeError::InvalidEventType => Bytes::from_static(b"event: error\ndata: {}\n\n"),
+            SseEncodeError::Json(_) => Bytes::from(format!("event: {event_type}\ndata: {{}}\n\n")),
+        })
 }
 
 /// Send an SSE error event.
-pub(crate) async fn send_error(tx: &mpsc::Sender<Result<Bytes, io::Error>>, message: &str) -> bool {
+pub(crate) async fn send_error(
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    enc: &mut SseEncoder,
+    message: &str,
+) -> bool {
     let data = serde_json::json!({
         "type": "error",
         "error": {
@@ -119,13 +127,14 @@ pub(crate) async fn send_error(tx: &mpsc::Sender<Result<Bytes, io::Error>>, mess
             "message": message
         }
     });
-    send_event(tx, "error", &data).await
+    send_event(tx, enc, "error", &data).await
 }
 
 /// Emit `content_block_start` + `content_block_stop` events for an
 /// `mcp_tool_result` block.
 pub(crate) async fn emit_mcp_tool_result(
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    enc: &mut SseEncoder,
     call: &McpToolCall,
     global_index: &mut u32,
 ) -> bool {
@@ -146,7 +155,7 @@ pub(crate) async fn emit_mcp_tool_result(
         }
     });
 
-    if !send_event(tx, "content_block_start", &block_start).await {
+    if !send_event(tx, enc, "content_block_start", &block_start).await {
         return false;
     }
 
@@ -156,7 +165,7 @@ pub(crate) async fn emit_mcp_tool_result(
         "index": index
     });
 
-    if !send_event(tx, "content_block_stop", &block_stop).await {
+    if !send_event(tx, enc, "content_block_stop", &block_stop).await {
         return false;
     }
 
@@ -167,6 +176,7 @@ pub(crate) async fn emit_mcp_tool_result(
 /// Emit the final `message_delta` and `message_stop` events.
 pub(crate) async fn emit_final(
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    enc: &mut SseEncoder,
     stop_reason: Option<&StopReason>,
     total_input_tokens: u32,
     total_output_tokens: u32,
@@ -187,14 +197,14 @@ pub(crate) async fn emit_final(
         }
     });
 
-    if !send_event(tx, "message_delta", &message_delta).await {
+    if !send_event(tx, enc, "message_delta", &message_delta).await {
         debug!("Failed to send final message_delta — channel closed");
     }
 
     let message_stop = serde_json::json!({
         "type": "message_stop"
     });
-    if !send_event(tx, "message_stop", &message_stop).await {
+    if !send_event(tx, enc, "message_stop", &message_stop).await {
         debug!("Failed to send message_stop — channel closed");
     }
 }
@@ -210,6 +220,7 @@ pub(crate) async fn emit_final(
 /// decoupling this function from `McpToolSession`.
 pub(crate) async fn consume_and_forward<F>(
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    enc: &mut SseEncoder,
     response: reqwest::Response,
     global_index: &mut u32,
     is_first_iteration: bool,
@@ -220,8 +231,13 @@ where
 {
     let mut stream = response.bytes_stream();
     let mut decoder = SseDecoder::with_max_size(MAX_SSE_BUFFER_SIZE);
-    let mut processor =
-        EventProcessor::new(tx, global_index, is_first_iteration, resolve_server_name);
+    let mut processor = EventProcessor::new(
+        tx,
+        enc,
+        global_index,
+        is_first_iteration,
+        resolve_server_name,
+    );
 
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| format!("Stream read error: {e}"))?;
@@ -424,6 +440,7 @@ impl BlockAccumulator {
 /// tool names to MCP server labels.
 struct EventProcessor<'a, F> {
     tx: &'a mpsc::Sender<Result<Bytes, io::Error>>,
+    enc: &'a mut SseEncoder,
     global_index: &'a mut u32,
     index_base: u32,
     is_first_iteration: bool,
@@ -439,6 +456,7 @@ where
 {
     fn new(
         tx: &'a mpsc::Sender<Result<Bytes, io::Error>>,
+        enc: &'a mut SseEncoder,
         global_index: &'a mut u32,
         is_first_iteration: bool,
         resolve_server_name: F,
@@ -446,6 +464,7 @@ where
         let index_base = *global_index;
         Self {
             tx,
+            enc,
             global_index,
             index_base,
             is_first_iteration,
@@ -469,8 +488,8 @@ where
     }
 
     /// Send an SSE event to the client, returning `Err` on disconnect.
-    async fn send(&self, event_type: &str, data: &Value) -> Result<(), String> {
-        if !send_event(self.tx, event_type, data).await {
+    async fn send(&mut self, event_type: &str, data: &Value) -> Result<(), String> {
+        if !send_event(self.tx, self.enc, event_type, data).await {
             return Err(CLIENT_DISCONNECTED_ERROR.into());
         }
         Ok(())
@@ -752,7 +771,8 @@ mod tests {
     #[test]
     fn test_format_sse_event() {
         let data = serde_json::json!({"type": "ping"});
-        let bytes = format_sse_event("ping", &data);
+        let mut enc = SseEncoder::new();
+        let bytes = format_sse_event(&mut enc, "ping", &data);
         let text = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(text.starts_with("event: ping\n"));
         assert!(text.contains("data: "));
