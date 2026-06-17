@@ -6,7 +6,7 @@ githubConfigUrl: "https://github.com/lightseekorg/smg"
 githubConfigSecret: github-arc-secret
 
 ## Runner scaling configuration
-minRunners: 2
+minRunners: 4
 maxRunners: 8
 
 ## name of the runner scale set to create.  Defaults to the helm release name
@@ -20,11 +20,12 @@ template:
   spec:
     terminationGracePeriodSeconds: 600
 
-    # hostNetwork puts the runner in the host netns so PD disaggregation KV
-    # transfer (NIXL/Mooncake) sees the host's populated RoCE GID tables. An
-    # overlay-CNI pod sees the mlx5 NICs as PORT_ACTIVE but with an empty GID
-    # table, so RDMA init dies at worker startup. ClusterFirstWithHostNet keeps
-    # cluster DNS working while on the host network.
+    # Volcano binpack packs GPU runners onto fewer nodes
+    # (weights: volcano-scheduler-configmap.yaml).
+    schedulerName: volcano
+
+    # hostNetwork: RDMA KV transfer (NIXL/Mooncake) needs the host's RoCE GID
+    # tables; an overlay netns has empty GIDs and RDMA init fails.
     hostNetwork: true
     dnsPolicy: ClusterFirstWithHostNet
 
@@ -38,28 +39,16 @@ template:
         value: "true"
         effect: "NoSchedule"
 
-    # With hostNetwork the pod shares the host port space, so spread 2-gpu PD
-    # runners one-per-node to avoid host-port collisions between concurrent PD
-    # jobs (replaces the previous GPU bin-packing podAffinity).
-    affinity:
-      podAntiAffinity:
-        preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 100
-            podAffinityTerm:
-              labelSelector:
-                matchExpressions:
-                  - key: actions.github.com/scale-set-name
-                    operator: In
-                    values:
-                      - 2-gpu-h100
-              topologyKey: kubernetes.io/hostname
+    # No affinity: placement left to binpack. e2e servers bind OS-assigned
+    # ports on 127.0.0.1, so co-located hostNetwork runners don't collide.
 
     volumes:
       - name: work
         emptyDir: {}
       - name: model-cache
-        persistentVolumeClaim:
-          claimName: model-cache
+        hostPath:
+          path: /raid/models
+          type: Directory
       - name: dshm
         emptyDir:
           medium: Memory
@@ -70,6 +59,10 @@ template:
         emptyDir: {}
       - name: docker-storage
         emptyDir: {}
+      - name: infiniband
+        hostPath:
+          path: /dev/infiniband
+          type: Directory
 
     containers:
       - name: runner
@@ -77,12 +70,12 @@ template:
         command:
           - /home/runner/run.sh
         securityContext:
-          # The runner runs as non-root (uid 1001), so capabilities.add:
-          # [IPC_LOCK] only reaches the bounding set (not effective) and the
-          # default 64KiB RLIMIT_MEMLOCK blocks RDMA completion-queue
-          # allocation (ibv_create_cq -> ENOMEM, e.g. sglang/Mooncake).
-          # privileged makes IPC_LOCK effective and lifts the memlock cap.
-          privileged: true
+          # Non-root runner (uid 1001) + IPC_LOCK lets RDMA pin completion-queue
+          # memory (ibv_create_cq) without granting full privileged.
+          privileged: false
+          capabilities:
+            add:
+              - IPC_LOCK
         env:
           - name: DOCKER_HOST
             value: unix:///var/run/docker.sock
@@ -95,21 +88,6 @@ template:
               secretKeyRef:
                 key: HUGGINGFACE_API_KEY
                 name: huggingface-secret
-          - name: OPENAI_API_KEY
-            valueFrom:
-              secretKeyRef:
-                key: OPENAI_API_KEY
-                name: openai-api-key
-          - name: ANTHROPIC_API_KEY
-            valueFrom:
-              secretKeyRef:
-                key: ANTHROPIC_API_KEY
-                name: anthropic-api-key
-          - name: XAI_API_KEY
-            valueFrom:
-              secretKeyRef:
-                key: XAI_API_KEY
-                name: xai-api-key
           - name: NODE_IP
             valueFrom:
               fieldRef:
@@ -118,8 +96,10 @@ template:
           requests:
             cpu: '32'
             memory: 128Gi
+            rdma/hca_shared_devices_a: '1'
           limits:
             nvidia.com/gpu: 2
+            rdma/hca_shared_devices_a: '1'
         volumeMounts:
           - name: model-cache
             mountPath: /models
@@ -131,6 +111,8 @@ template:
             mountPath: /var/run
           - name: docker-storage
             mountPath: /var/lib/docker
+          - name: infiniband
+            mountPath: /dev/infiniband
 
     initContainers:
       - name: init-dind-externals
@@ -162,12 +144,18 @@ template:
         securityContext:
           privileged: true
         resources:
+          # genai-bench (and any `docker run` workload) executes inside this dind
+          # cgroup, whose memory limit also caps the page cache for reading the
+          # multi-GB CUDA/torch image. At 4Gi a cold image read thrashes (constant
+          # reclaim + re-read), ballooning container startup to minutes and
+          # tripping the benchmark suite's 480s watchdog. Size for driver RSS +
+          # image page cache; the H100 nodes have ample RAM.
           limits:
-            cpu: '2'
-            memory: 4Gi
+            cpu: '8'
+            memory: 32Gi
           requests:
-            cpu: '1'
-            memory: 2Gi
+            cpu: '4'
+            memory: 8Gi
         startupProbe:
           exec:
             command:
