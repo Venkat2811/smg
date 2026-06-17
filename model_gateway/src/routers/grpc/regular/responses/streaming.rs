@@ -57,7 +57,10 @@ use crate::{
         grpc::{
             common::responses::{
                 build_sse_response, persist_response_if_needed,
-                streaming::{attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter},
+                streaming::{
+                    attach_mcp_server_label, OutputItemKind, ResponseEventSink,
+                    ResponseStreamEventEmitter, WsResponseEventSink,
+                },
                 ResponsesContext,
             },
             utils,
@@ -148,8 +151,47 @@ async fn process_and_transform_sse_stream(
     request_context: Option<StorageRequestContext>,
     tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
+    // Drive the transport-neutral core over the SSE sender. `process_chunk`
+    // emits `completed` (draining state) on this path for byte-identical SSE
+    // output; the finalized response is then persisted.
+    let final_response = drive_non_mcp_stream(
+        body,
+        &original_request,
+        &tx,
+        /* drain_completed */ true,
+    )
+    .await?;
+
+    // Finalize and persist accumulated response
+    persist_response_if_needed(
+        conversation_storage,
+        conversation_item_storage,
+        response_storage,
+        &final_response,
+        &original_request,
+        request_context,
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Sink-generic core for the non-MCP streaming path.
+///
+/// Emits `response.created` / `response.in_progress`, then transforms each chat
+/// SSE chunk into Responses events on `sink`, accumulates the response, and
+/// (when `drain_completed`) emits the terminal `response.completed`. Returns the
+/// finalized [`ResponsesResponse`] so the WS path can populate its connection
+/// cache (it sets `drain_completed = false` and emits `completed`/`failed`
+/// itself with an explicit status).
+async fn drive_non_mcp_stream(
+    body: Body,
+    original_request: &ResponsesRequest,
+    sink: &impl ResponseEventSink,
+    drain_completed: bool,
+) -> Result<ResponsesResponse, String> {
     // Create accumulator for final response
-    let mut accumulator = StreamingResponseAccumulator::new(&original_request);
+    let mut accumulator = StreamingResponseAccumulator::new(original_request);
 
     // Create event emitter for OpenAI-compatible streaming
     let response_id = format!("resp_{}", Uuid::now_v7());
@@ -161,12 +203,12 @@ async fn process_and_transform_sse_stream(
     // Emit initial response.created and response.in_progress events
     let event = event_emitter.emit_created();
     event_emitter
-        .send_event(&event, &tx)
+        .send_event(&event, sink)
         .map_err(|_| "Failed to send response.created event".to_string())?;
 
     let event = event_emitter.emit_in_progress();
     event_emitter
-        .send_event(&event, &tx)
+        .send_event(&event, sink)
         .map_err(|_| "Failed to send response.in_progress event".to_string())?;
 
     // Convert body to data stream
@@ -196,14 +238,13 @@ async fn process_and_transform_sse_stream(
                     accumulator.process_chunk(&chat_chunk);
 
                     // Process chunk through event emitter (emits proper OpenAI events)
-                    event_emitter.process_chunk(&chat_chunk, &tx)?;
+                    event_emitter.process_chunk(&chat_chunk, sink)?;
                 }
                 Err(_) => {
                     // Not a valid chat chunk - might be error event, pass through
                     debug!("Non-chunk SSE event, passing through: {}", event);
-                    if tx.send(Ok(Bytes::from(format!("{event}\n\n")))).is_err() {
-                        return Err("Client disconnected".to_string());
-                    }
+                    sink.send_raw_json(event)
+                        .map_err(|_| "Client disconnected".to_string())?;
                 }
             }
         }
@@ -228,22 +269,74 @@ async fn process_and_transform_sse_stream(
         usage_obj
     });
 
-    let completed_event = event_emitter.emit_completed(usage_json.as_ref());
-    event_emitter.send_event(&completed_event, &tx)?;
+    if drain_completed {
+        let completed_event = event_emitter.emit_completed(usage_json.as_ref());
+        event_emitter.send_event(&completed_event, sink)?;
+    } else {
+        // WS path: emit the terminal event with an explicit status (CLONE — does
+        // not drain — so the finalized cache response below sees the items).
+        let status = accumulator.status();
+        let completed_event = event_emitter.emit_completed_with_status(status, usage_json.as_ref());
+        event_emitter.send_event(&completed_event, sink)?;
+    }
 
-    // Finalize and persist accumulated response
-    let final_response = accumulator.finalize();
+    // Finalize accumulated response (used for persistence and/or WS cache).
+    //
+    // The accumulator adopts the worker's chat-completion id (`chatcmpl-…`) from
+    // the first chunk, but the client received the emitter's `resp_…` id in the
+    // streamed events. Stamp the finalized response with the emitter id so the
+    // persisted/cached response is keyed by the id the client holds — required
+    // for `previous_response_id` continuation (durable + WS connection cache).
+    let mut final_response = accumulator.finalize();
+    final_response.id.clone_from(&event_emitter.response_id);
+    Ok(final_response)
+}
+
+/// Execute the non-MCP streaming pipeline over an arbitrary sink and return the
+/// finalized response. Used by the WebSocket Responses executor; the chat
+/// pipeline is driven inline (no fire-and-forget spawn / SSE body) so the caller
+/// can await the materialized [`ResponsesResponse`] for its connection cache.
+pub(crate) async fn execute_non_mcp_stream_with_sink(
+    ctx: &ResponsesContext,
+    chat_request: Arc<ChatCompletionRequest>,
+    original_request: ResponsesRequest,
+    headers: Option<header::HeaderMap>,
+    model_id: Option<String>,
+    sink: &WsResponseEventSink,
+) -> Result<ResponsesResponse, String> {
+    let chat_response = ctx
+        .pipeline
+        .execute_chat(
+            chat_request,
+            headers,
+            model_id.unwrap_or_else(|| original_request.model.clone()),
+            ctx.components.clone(),
+            None,
+        )
+        .await;
+
+    let (_parts, body) = chat_response.into_parts();
+
+    let final_response = drive_non_mcp_stream(
+        body,
+        &original_request,
+        sink,
+        /* drain_completed */ false,
+    )
+    .await?;
+
+    // Persist if store=true so /v1/responses/{id} retrieval works for WS too.
     persist_response_if_needed(
-        conversation_storage,
-        conversation_item_storage,
-        response_storage,
+        ctx.conversation_storage.clone(),
+        ctx.conversation_item_storage.clone(),
+        ctx.response_storage.clone(),
         &final_response,
         &original_request,
-        request_context,
+        ctx.request_context.clone(),
     )
     .await;
 
-    Ok(())
+    Ok(final_response)
 }
 
 /// Response accumulator for streaming responses (non-MCP path)
@@ -356,7 +449,23 @@ impl StreamingResponseAccumulator {
         }
     }
 
+    /// Terminal status derived from the accumulated `finish_reason`.
+    ///
+    /// Borrows `&self` so the WS path can read the status before `finalize`
+    /// consumes the accumulator. Mirrors the mapping in `finalize`.
+    fn status(&self) -> ResponseStatus {
+        match self.finish_reason.as_deref() {
+            Some("stop") | Some("length") => ResponseStatus::Completed,
+            Some("tool_calls") => ResponseStatus::InProgress,
+            Some("failed") | Some("error") => ResponseStatus::Failed,
+            _ => ResponseStatus::Completed,
+        }
+    }
+
     fn finalize(self) -> ResponsesResponse {
+        // Determine final status before consuming fields out of `self`.
+        let status = self.status();
+
         let mut output: Vec<ResponseOutputItem> = Vec::new();
 
         // Add message content if present
@@ -388,14 +497,6 @@ impl StreamingResponseAccumulator {
 
         // Add tool calls
         output.extend(self.tool_calls);
-
-        // Determine final status
-        let status = match self.finish_reason.as_deref() {
-            Some("stop") | Some("length") => ResponseStatus::Completed,
-            Some("tool_calls") => ResponseStatus::InProgress,
-            Some("failed") | Some("error") => ResponseStatus::Failed,
-            _ => ResponseStatus::Completed,
-        };
 
         // Convert usage
         let usage = self.usage.as_ref().map(|u| {
@@ -457,10 +558,13 @@ pub(super) fn execute_tool_loop_streaming(
             &original_request_clone,
             params,
             mcp_servers,
-            tx.clone(),
+            &tx,
+            /* drain_completed */ true,
         )
         .await;
 
+        // The SSE path discards the materialized response (persistence happens
+        // inside the tool loop / accumulator); only surface errors.
         if let Err(e) = result {
             warn!("Streaming tool loop error: {}", e);
             utils::send_error_sse(&tx, &e, "tool_loop_error");
@@ -499,15 +603,64 @@ pub(super) fn execute_tool_loop_streaming(
     response
 }
 
+/// Execute the MCP streaming tool loop over a WebSocket sink and return the
+/// finalized response for the connection cache.
+///
+/// Mirrors [`execute_tool_loop_streaming`] but drives the loop inline (no
+/// fire-and-forget spawn / SSE body) so the caller can await the materialized
+/// [`ResponsesResponse`]. The WebSocket transport is inherently event-streamed,
+/// so the terminal `response.completed`/`failed` is emitted with an explicit
+/// status (no draining) and the response is materialized non-destructively.
+pub(crate) async fn execute_tool_loop_streaming_with_sink(
+    ctx: &ResponsesContext,
+    current_request: ResponsesRequest,
+    original_request: &ResponsesRequest,
+    headers: Option<header::HeaderMap>,
+    model_id: Option<String>,
+    mcp_servers: Vec<McpServerBinding>,
+    sink: &WsResponseEventSink,
+) -> Result<ResponsesResponse, String> {
+    // WS sessions resolve tenant via the route_request_meta middleware on the
+    // realtime-style route group, but the meta is not threaded down to the
+    // executor; use an anonymous charge identity for the inline pipeline call.
+    let tenant_request_meta = crate::middleware::TenantRequestMeta::new(
+        crate::tenant::TenantIdentity::Anonymous.into_key(),
+    );
+    let params = ResponsesCallContext {
+        headers,
+        model_id: model_id.unwrap_or_else(|| current_request.model.clone()),
+        response_id: None,
+        tenant_request_meta,
+    };
+
+    execute_tool_loop_streaming_internal(
+        ctx,
+        current_request,
+        original_request,
+        params,
+        mcp_servers,
+        sink,
+        /* drain_completed */ false,
+    )
+    .await
+}
+
 /// Internal streaming tool loop implementation
+///
+/// Sink-generic so both the SSE and WebSocket Responses paths reuse the same
+/// MCP tool-loop, event-emission and accumulation logic. When `drain_completed`
+/// is true (SSE) the terminal `response.completed` event is emitted by draining
+/// emitter state; when false (WS) it is emitted with an explicit status via a
+/// clone so the returned [`ResponsesResponse`] still carries the full output.
 async fn execute_tool_loop_streaming_internal(
     ctx: &ResponsesContext,
     mut current_request: ResponsesRequest,
     original_request: &ResponsesRequest,
     params: ResponsesCallContext,
     mcp_servers: Vec<McpServerBinding>,
-    tx: mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
-) -> Result<(), String> {
+    sink: &impl ResponseEventSink,
+    drain_completed: bool,
+) -> Result<ResponsesResponse, String> {
     let mut state = ToolLoopState::new(original_request.input.clone());
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
@@ -528,9 +681,9 @@ async fn execute_tool_loop_streaming_internal(
 
     // Emit initial response.created and response.in_progress events
     let event = emitter.emit_created();
-    emitter.send_event(&event, &tx)?;
+    emitter.send_event(&event, sink)?;
     let event = emitter.emit_in_progress();
-    emitter.send_event(&event, &tx)?;
+    emitter.send_event(&event, sink)?;
 
     // Get MCP tools and convert to chat format (do this once before loop)
     let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&session);
@@ -542,7 +695,11 @@ async fn execute_tool_loop_streaming_internal(
     // Flag to track if mcp_list_tools has been emitted
     let mut mcp_list_tools_emitted = false;
 
-    loop {
+    // Terminal (usage, status) captured at whichever `break` the loop exits
+    // through, used to materialize the finalized response for the WS cache /
+    // persistence. The function-tool-call and tool-limit exits leave the turn
+    // pending (`InProgress`); only natural completion reports `Completed`.
+    let (terminal_usage, terminal_status) = loop {
         state.iteration += 1;
 
         // Record tool loop iteration metric
@@ -561,7 +718,7 @@ async fn execute_tool_loop_streaming_internal(
             for binding in session.mcp_servers() {
                 let tools_for_server = session.list_tools_for_server(&binding.server_key);
 
-                emitter.emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, &tx)?;
+                emitter.emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, sink)?;
             }
             mcp_list_tools_emitted = true;
         }
@@ -588,7 +745,7 @@ async fn execute_tool_loop_streaming_internal(
         // Convert chat stream to Responses API events while accumulating for tool call detection
         // Stream text naturally - it only appears on final iteration (tool iterations have empty content)
         let accumulated_response =
-            convert_and_accumulate_stream(response.into_body(), &mut emitter, &tx).await?;
+            convert_and_accumulate_stream(response.into_body(), &mut emitter, sink).await?;
 
         // Check for tool calls (extract all of them for parallel execution)
         let tool_calls = extract_all_tool_calls_from_chat(&accumulated_response);
@@ -627,7 +784,11 @@ async fn execute_tool_loop_streaming_internal(
                     max_tool_calls,
                     DEFAULT_MAX_ITERATIONS
                 );
-                break;
+                // TODO(phase2): max_tool_calls should surface status=failed + an
+                // error payload per main's contract (NOT incomplete_details).
+                // For now keep main's current behavior: stop the loop and return
+                // the accumulated turn unchanged (pending → InProgress).
+                break (accumulated_response.usage, ResponseStatus::InProgress);
             }
 
             // Process each MCP tool call
@@ -674,12 +835,12 @@ async fn execute_tool_loop_streaming_internal(
 
                 // Emit output_item.added
                 let event = emitter.emit_output_item_added(output_index, &item);
-                emitter.send_event(&event, &tx)?;
+                emitter.send_event(&event, sink)?;
 
                 // Emit tool_call.in_progress
                 let event =
                     emitter.emit_tool_call_in_progress(output_index, &item_id, response_format);
-                emitter.send_event(&event, &tx)?;
+                emitter.send_event(&event, sink)?;
 
                 // Emit arguments events for mcp_call only (skip for builtin tools)
                 if matches!(response_format, ResponseFormat::Passthrough) {
@@ -689,7 +850,7 @@ async fn execute_tool_loop_streaming_internal(
                         &item_id,
                         &tool_call.arguments,
                     );
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, sink)?;
 
                     // Emit mcp_call_arguments.done
                     let event = emitter.emit_mcp_call_arguments_done(
@@ -697,14 +858,14 @@ async fn execute_tool_loop_streaming_internal(
                         &item_id,
                         &tool_call.arguments,
                     );
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, sink)?;
                 }
 
                 // Emit searching/interpreting event for builtin tools
                 if let Some(event) =
                     emitter.emit_tool_call_searching(output_index, &item_id, response_format)
                 {
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, sink)?;
                 }
 
                 // Execute the MCP tool
@@ -769,7 +930,7 @@ async fn execute_tool_loop_streaming_internal(
                 if success {
                     let event =
                         emitter.emit_tool_call_completed(output_index, &item_id, response_format);
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, sink)?;
                 } else {
                     let err_text = tool_output
                         .error_message
@@ -784,19 +945,19 @@ async fn execute_tool_loop_streaming_internal(
                     // content.
                     if matches!(response_format, ResponseFormat::Passthrough) {
                         let event = emitter.emit_mcp_call_failed(output_index, &item_id, &err_text);
-                        emitter.send_event(&event, &tx)?;
+                        emitter.send_event(&event, sink)?;
                     } else {
                         let event = emitter.emit_tool_call_completed(
                             output_index,
                             &item_id,
                             response_format,
                         );
-                        emitter.send_event(&event, &tx)?;
+                        emitter.send_event(&event, sink)?;
                     }
                 }
 
                 let event = emitter.emit_output_item_done(output_index, &item_done);
-                emitter.send_event(&event, &tx)?;
+                emitter.send_event(&event, sink)?;
                 emitter.complete_output_item(output_index);
 
                 Metrics::record_mcp_tool_duration(
@@ -849,7 +1010,7 @@ async fn execute_tool_loop_streaming_internal(
 
                     // Emit output_item.added
                     let event = emitter.emit_output_item_added(output_index, &item);
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, sink)?;
 
                     // Emit function_call_arguments.delta
                     let event = emitter.emit_function_call_arguments_delta(
@@ -857,7 +1018,7 @@ async fn execute_tool_loop_streaming_internal(
                         &item_id,
                         &tool_call.arguments,
                     );
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, sink)?;
 
                     // Emit function_call_arguments.done
                     let event = emitter.emit_function_call_arguments_done(
@@ -865,7 +1026,7 @@ async fn execute_tool_loop_streaming_internal(
                         &item_id,
                         &tool_call.arguments,
                     );
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, sink)?;
 
                     // Build complete item
                     let item_complete = json!({
@@ -879,13 +1040,14 @@ async fn execute_tool_loop_streaming_internal(
 
                     // Emit output_item.done
                     let event = emitter.emit_output_item_done(output_index, &item_complete);
-                    emitter.send_event(&event, &tx)?;
+                    emitter.send_event(&event, sink)?;
 
                     emitter.complete_output_item(output_index);
                 }
 
-                // Break loop to return response to caller
-                break;
+                // Break loop to return response to caller. Function tool calls
+                // leave the turn pending on the client; status stays InProgress.
+                break (accumulated_response.usage, ResponseStatus::InProgress);
             }
 
             // Build next request with conversation history
@@ -906,7 +1068,7 @@ async fn execute_tool_loop_streaming_internal(
         // Emit reasoning item if present
         if let Some(reasoning) = reasoning_content {
             if !reasoning.is_empty() {
-                emitter.emit_reasoning_item(&tx, Some(reasoning))?;
+                emitter.emit_reasoning_item(sink, Some(reasoning))?;
             }
         }
 
@@ -921,20 +1083,30 @@ async fn execute_tool_loop_streaming_internal(
                 "total_tokens": u.total_tokens
             })
         });
-        let event = emitter.emit_completed(usage_json.as_ref());
-        emitter.send_event(&event, &tx)?;
+        if drain_completed {
+            let event = emitter.emit_completed(usage_json.as_ref());
+            emitter.send_event(&event, sink)?;
+        } else {
+            // WS path: emit terminal event with explicit Completed status without
+            // draining emitter state (the cache response is built below).
+            let event =
+                emitter.emit_completed_with_status(ResponseStatus::Completed, usage_json.as_ref());
+            emitter.send_event(&event, sink)?;
+        }
+        break (accumulated_response.usage, ResponseStatus::Completed);
+    };
 
-        break;
-    }
-
-    Ok(())
+    // Materialize the finalized response from the (non-drained) emitter state so
+    // the WS connection cache and any persistence see the full output. On the SSE
+    // path the caller discards this value.
+    Ok(emitter.finalize_with_status(terminal_usage, terminal_status))
 }
 
 /// Convert chat stream to Responses API events while accumulating for tool call detection
 async fn convert_and_accumulate_stream(
     body: Body,
     emitter: &mut ResponseStreamEventEmitter,
-    tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    sink: &impl ResponseEventSink,
 ) -> Result<ChatCompletionResponse, String> {
     let mut accumulator = ChatResponseAccumulator::new();
     let mut stream = body.into_data_stream();
@@ -954,7 +1126,7 @@ async fn convert_and_accumulate_stream(
             let json_str = json_str.trim();
             if let Ok(chat_chunk) = serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
                 // Convert chat chunk to Responses API events and emit
-                emitter.process_chunk(&chat_chunk, tx)?;
+                emitter.process_chunk(&chat_chunk, sink)?;
 
                 // Accumulate for tool call detection
                 accumulator.process_chunk(&chat_chunk);
@@ -1108,5 +1280,119 @@ mod tests {
             }
             other => panic!("expected function tool call, got {other:?}"),
         }
+    }
+
+    /// Collecting [`ResponseEventSink`] that records every emitted event so a
+    /// test can inspect the wire frames the client would have received.
+    #[derive(Default)]
+    struct CollectingSink {
+        events: std::sync::Mutex<Vec<Value>>,
+    }
+
+    impl CollectingSink {
+        /// The `id` carried by the most recent `response.completed` frame — the
+        /// id the client actually observed on the wire.
+        fn streamed_completed_id(&self) -> Option<String> {
+            self.events
+                .lock()
+                .expect("sink mutex poisoned")
+                .iter()
+                .rev()
+                .find(|event| event["type"] == "response.completed")
+                .and_then(|event| event["response"]["id"].as_str().map(str::to_owned))
+        }
+    }
+
+    impl ResponseEventSink for CollectingSink {
+        fn send_event(&self, event: &Value) -> Result<(), String> {
+            self.events
+                .lock()
+                .expect("sink mutex poisoned")
+                .push(event.clone());
+            Ok(())
+        }
+
+        fn send_raw_json(&self, _payload: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Frame an SSE body out of chat chunks whose ids begin with `chatcmpl-`,
+    /// the same shape the worker emits.
+    fn sse_body_from_chunks(chunks: &[ChatCompletionStreamResponse]) -> Body {
+        let mut payload = String::new();
+        for chunk in chunks {
+            let json = serde_json::to_string(chunk).expect("chunk serializes");
+            payload.push_str("data: ");
+            payload.push_str(&json);
+            payload.push_str("\n\n");
+        }
+        payload.push_str("data: [DONE]\n\n");
+        Body::from(payload)
+    }
+
+    /// Regression: the worker stamps each chat chunk with its own
+    /// `chatcmpl-…` id, but the client receives (and continuation relies on)
+    /// the emitter's `resp_…` id. `drive_non_mcp_stream` must return a response
+    /// keyed by the emitter id — never the chunk id — and that returned id must
+    /// match the id streamed in `response.completed`. Caught only by live
+    /// inference before this test existed (resp_/chatcmpl- mismatch broke
+    /// `previous_response_id` continuation).
+    #[tokio::test]
+    async fn drive_non_mcp_stream_stamps_emitter_resp_id_not_chunk_id() {
+        let chunk = ChatCompletionStreamResponse::builder("chatcmpl-fake-worker-123", "test-model")
+            .add_choice_content(0, "assistant", "hello world")
+            .build();
+        // A second chunk carrying the terminal finish_reason and usage.
+        let mut finish_chunk =
+            ChatCompletionStreamResponse::builder("chatcmpl-fake-worker-123", "test-model").build();
+        finish_chunk
+            .choices
+            .push(openai_protocol::chat::ChatStreamChoice {
+                index: 0,
+                delta: openai_protocol::chat::ChatMessageDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                logprobs: None,
+                finish_reason: Some("stop".to_string()),
+                matched_stop: None,
+            });
+
+        let body = sse_body_from_chunks(&[chunk, finish_chunk]);
+        let request = ResponsesRequest {
+            model: "test-model".to_string(),
+            ..Default::default()
+        };
+        let sink = CollectingSink::default();
+
+        // `drain_completed = false` exercises the WS path, which is the one that
+        // populates the connection cache from the returned response.
+        let final_response = drive_non_mcp_stream(body, &request, &sink, false)
+            .await
+            .expect("stream drives to completion");
+
+        assert!(
+            final_response.id.starts_with("resp_"),
+            "finalized id must be the emitter resp_ id, got {:?}",
+            final_response.id
+        );
+        assert!(
+            !final_response.id.contains("chatcmpl-"),
+            "finalized id must not adopt the worker chunk id, got {:?}",
+            final_response.id
+        );
+
+        // The id the client received on the wire must equal the id we cache /
+        // persist, so a follow-up `previous_response_id` resolves.
+        let streamed_id = sink
+            .streamed_completed_id()
+            .expect("a response.completed frame was streamed");
+        assert_eq!(
+            streamed_id, final_response.id,
+            "streamed completed id must match the finalized/cached id"
+        );
     }
 }

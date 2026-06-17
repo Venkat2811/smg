@@ -125,6 +125,7 @@ wasmtime = { workspace = true }
 tempfile = "3.8"
 multer = { workspace = true }
 str0m = { workspace = true }
+validator = "0.20.0"
 
 [build-dependencies]
 chrono = { version = "0.4", features = ["clock"] }
@@ -142,7 +143,6 @@ opentelemetry-proto = { version = "0.32", features = ["gen-tonic"] }
 serial_test = "3.0"
 rsa = { version = "0.9", features = ["sha2"] }
 jsonwebtoken = "9.3"
-validator = "0.20.0"
 tracing-test = "0.2"
 tokio = { workspace = true, features = ["test-util"] }
 kv-index.workspace = true
