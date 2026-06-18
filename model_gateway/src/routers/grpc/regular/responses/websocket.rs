@@ -166,6 +166,20 @@ impl WsResponsesExecutor for GrpcWsResponsesExecutor {
             "finished websocket response execution"
         );
 
+        // Persist (when store=true) once for BOTH the MCP and non-MCP paths, so
+        // reconnect retrieval (GET /v1/responses/{id}) and durable
+        // previous_response_id resolution work for tool-using responses too. The
+        // MCP path previously skipped persistence, breaking store=true durability.
+        persist_response_if_needed(
+            ctx.conversation_storage.clone(),
+            ctx.conversation_item_storage.clone(),
+            ctx.response_storage.clone(),
+            &final_response,
+            &request,
+            ctx.request_context.clone(),
+        )
+        .await;
+
         Ok(CachedWsResponse {
             response: final_response,
             input_items: normalize_request_input_items(&modified_request),
@@ -201,9 +215,20 @@ async fn response_to_ws_error(response: axum::response::Response) -> WsClientErr
         .map(str::to_string)
         .unwrap_or_else(|| format!("WebSocket Responses request failed with status {status}"));
 
-    WsClientError::new(error_code, error_message)
+    // Preserve the upstream `error.type` when present so mapped server errors
+    // aren't all flattened to the default `invalid_request_error`.
+    let error_type = parsed_error
+        .as_ref()
+        .and_then(|error| error.get("type"))
+        .and_then(|value| value.as_str());
+
+    let client_error = WsClientError::new(error_code, error_message)
         .with_status(status.as_u16())
-        .with_param_if_previous_response_not_found()
+        .with_param_if_previous_response_not_found();
+    match error_type {
+        Some(error_type) => client_error.with_type(error_type),
+        None => client_error,
+    }
 }
 
 async fn warmup_response_create(
