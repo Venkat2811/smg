@@ -779,9 +779,9 @@ impl WsResponsesExecutor for SemanticWsExecutor {
 async fn test_v1_responses_get_requires_websocket_upgrade() {
     // Current server requires a `model` query param and performs the WS upgrade
     // inside the router. A plain GET (with model, without upgrade headers) is
-    // rejected by `WebSocketUpgrade::from_request_parts` with 426/400 rather
-    // than the reference's `websocket_upgrade_required` body code, which does
-    // not exist on main. We assert the upgrade is refused (non-success status).
+    // rejected by `WebSocketUpgrade::from_request_parts`: with no `Connection:
+    // upgrade` header axum returns `400 Bad Request` deterministically (the
+    // reference's `websocket_upgrade_required` body code does not exist on main).
     let app = build_stub_app(Arc::new(StubWsExecutor::immediate())).await;
 
     let response = app
@@ -795,9 +795,10 @@ async fn test_v1_responses_get_requires_websocket_upgrade() {
         .await
         .unwrap();
 
-    assert!(
-        !response.status().is_success(),
-        "plain GET without upgrade headers must be rejected, got {}",
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "plain GET without upgrade headers must be rejected with 400, got {}",
         response.status()
     );
 }

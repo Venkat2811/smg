@@ -385,7 +385,8 @@ A **connection-local cache** resolves `previous_response_id` for same-socket con
 | Connection lifetime | Capped at 60 minutes |
 | `conversation` parameter | Rejected (use `previous_response_id`) |
 | Unknown event type | Rejected with an `error` event |
-| Malformed payload | Rejected with an `error` event (`invalid_request`) |
+| Malformed JSON | Rejected with an `error` event (`invalid_json`) |
+| Invalid `response.create` payload | Rejected with an `error` event (`invalid_request`) |
 
 ### Errors
 
