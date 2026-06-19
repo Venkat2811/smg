@@ -170,15 +170,35 @@ impl WsResponsesExecutor for GrpcWsResponsesExecutor {
         // reconnect retrieval (GET /v1/responses/{id}) and durable
         // previous_response_id resolution work for tool-using responses too. The
         // MCP path previously skipped persistence, breaking store=true durability.
-        persist_response_if_needed(
-            ctx.conversation_storage.clone(),
-            ctx.conversation_item_storage.clone(),
-            ctx.response_storage.clone(),
-            &final_response,
-            &request,
-            ctx.request_context.clone(),
-        )
-        .await;
+        //
+        // Detached on purpose: the session layer aborts THIS executor task when the
+        // client disconnects, to stop pre-terminal generation. But by here the
+        // terminal event is already enqueued (the response was delivered), so the
+        // durable write is post-terminal work that must NOT be cancelled by that
+        // abort — otherwise a store:true response the client already saw could be
+        // missing from GET / reconnect (the await is a cancellation point, widest
+        // under slow storage). Spawning it keeps only pre-terminal work abortable.
+        let persist_response = final_response.clone();
+        let persist_request = request.clone();
+        let conversation_storage = ctx.conversation_storage.clone();
+        let conversation_item_storage = ctx.conversation_item_storage.clone();
+        let response_storage = ctx.response_storage.clone();
+        let persist_request_context = ctx.request_context.clone();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "detached so a client disconnect (which aborts the executor task) cannot cancel the durable write for an already-delivered response"
+        )]
+        tokio::spawn(async move {
+            persist_response_if_needed(
+                conversation_storage,
+                conversation_item_storage,
+                response_storage,
+                &persist_response,
+                &persist_request,
+                persist_request_context,
+            )
+            .await;
+        });
 
         Ok(CachedWsResponse {
             response: final_response,

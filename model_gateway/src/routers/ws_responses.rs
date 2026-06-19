@@ -536,9 +536,15 @@ async fn handle_text_event(
                             elapsed_ms = request_started_at.elapsed().as_secs_f64() * 1000.0,
                             "completed websocket response.create request"
                         );
-                        session_guard.cached_response = (cached_response.response.status
-                            != ResponseStatus::Failed)
-                            .then_some(cached_response);
+                        // Only a successful turn updates the cache. A turn that
+                        // materialized a `Failed` response is not chainable, so it
+                        // must neither be cached NOR evict a still-valid prior
+                        // parent (mirrors the `Err` arm below). Overwriting with
+                        // `None` here would drop a `store:false` parent on a failed
+                        // child, breaking a retry of the same previous_response_id.
+                        if cached_response.response.status != ResponseStatus::Failed {
+                            session_guard.cached_response = Some(cached_response);
+                        }
                     }
                     Err(err) => {
                         // A failed continuation must NOT evict the cached parent.

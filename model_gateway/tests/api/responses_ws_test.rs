@@ -502,6 +502,67 @@ impl WsResponsesExecutor for PanicOnceWsExecutor {
     }
 }
 
+/// Three-call probe for the `Ok(status == Failed)` cache arm: call 0 is a
+/// successful parent (cached), call 1 materializes an `Ok(Failed)` child (a
+/// worker finish_reason=failed analogue, NOT an `Err`), and call 2 only succeeds
+/// if the session still holds the parent in its cache. Used to prove a failed
+/// child does not evict a still-valid `store:false` parent.
+#[derive(Clone, Default)]
+struct OkFailedChildWsExecutor {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl WsResponsesExecutor for OkFailedChildWsExecutor {
+    async fn execute_response_create(
+        &self,
+        _headers: HeaderMap,
+        request: ResponsesRequest,
+        _options: WsResponseCreateOptions,
+        cached_response: Option<CachedWsResponse>,
+        outbound_tx: mpsc::Sender<Message>,
+    ) -> Result<CachedWsResponse, WsClientError> {
+        let (response_id, status) = match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => ("resp_parent", ResponseStatus::Completed),
+            1 => ("resp_failed_child", ResponseStatus::Failed),
+            _ => {
+                // Retry: resolve ONLY if the parent survived in the connection
+                // cache (the session passes it as cached_response).
+                let parent_alive = cached_response
+                    .as_ref()
+                    .is_some_and(|cached| cached.response.id == "resp_parent");
+                if !parent_alive {
+                    return Err(WsClientError::new(
+                        "previous_response_not_found",
+                        "cached parent was evicted by the failed child",
+                    )
+                    .with_param("previous_response_id"));
+                }
+                ("resp_retry", ResponseStatus::Completed)
+            }
+        };
+
+        let response = ResponsesResponse::builder(response_id, request.model.clone())
+            .copy_from_request(&request)
+            .status(status.clone())
+            .output(vec![])
+            .build();
+        let created = serde_json::json!({
+            "type": "response.created",
+            "response": { "id": response_id, "object": "response", "status": "in_progress", "model": request.model, "output": [] }
+        });
+        let _ = outbound_tx.try_send(Message::Text(created.to_string().into()));
+        let completed =
+            serde_json::json!({ "type": "response.completed", "response": response.clone() });
+        let _ = outbound_tx.try_send(Message::Text(completed.to_string().into()));
+
+        Ok(CachedWsResponse {
+            response,
+            input_items: vec![],
+        })
+    }
+}
+
 #[derive(Clone)]
 struct StubWsRouter {
     executor: Arc<dyn WsResponsesExecutor>,
@@ -1501,6 +1562,56 @@ async fn test_v1_responses_ws_keeps_cached_response_after_failed_continuation() 
     .await;
     let retry_completed = retry_events.last().unwrap();
     assert_eq!(retry_completed["type"], "response.completed");
+}
+
+/// Companion to the eviction fix on the `Err` arm: a child that materializes an
+/// `Ok` response with status=failed (a worker finish_reason=failed analogue, not
+/// an `Err`) must also NOT evict the cached parent. A `store:false` parent is
+/// chainable only through the connection cache, so a retry of the same
+/// previous_response_id must still resolve. Regression for the `Ok(Failed)` cache
+/// arm (ws_responses.rs).
+#[tokio::test]
+async fn test_v1_responses_ws_keeps_cached_parent_after_ok_failed_child() {
+    let url = serve_app(build_stub_app(Arc::new(OkFailedChildWsExecutor::default())).await).await;
+    let (mut socket, _) = connect_async(ws_endpoint(&url)).await.unwrap();
+
+    // turn 1: successful parent (store:false) -> cached by the session.
+    let first = send_ws_request_and_collect(
+        &mut socket,
+        ws_create_request(serde_json::json!({
+            "model": "mock-model", "input": "first", "store": false
+        })),
+    )
+    .await;
+    assert_eq!(first.last().unwrap()["type"], "response.completed");
+
+    // turn 2: a child that materializes Ok(status=failed). Must NOT evict turn 1.
+    let failed = send_ws_request_and_collect(
+        &mut socket,
+        ws_create_request(serde_json::json!({
+            "model": "mock-model", "input": "fail", "store": false
+        })),
+    )
+    .await;
+    let failed_last = failed.last().unwrap();
+    assert_eq!(failed_last["type"], "response.completed");
+    assert_eq!(failed_last["response"]["status"], "failed");
+
+    // turn 3: retry referencing the parent -> resolves only if the parent
+    // survived the failed child (executor 404s otherwise).
+    let retry = send_ws_request_and_collect(
+        &mut socket,
+        ws_create_request(serde_json::json!({
+            "model": "mock-model", "input": "retry",
+            "previous_response_id": "resp_parent", "store": false
+        })),
+    )
+    .await;
+    assert_eq!(
+        retry.last().unwrap()["type"],
+        "response.completed",
+        "a failed Ok child must not evict the cached parent"
+    );
 }
 
 #[tokio::test]
