@@ -328,11 +328,11 @@ pub(crate) async fn load_conversation_history_with_cache(
             None => get_conv_fut.await,
         }
         .map_err(|e| {
-                error::internal_error(
-                    "check_conversation_failed",
-                    format!("Failed to check conversation: {e}"),
-                )
-            })?;
+            error::internal_error(
+                "check_conversation_failed",
+                format!("Failed to check conversation: {e}"),
+            )
+        })?;
 
         if conversation.is_none() {
             return Err(error::not_found(
