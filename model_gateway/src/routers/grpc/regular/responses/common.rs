@@ -319,12 +319,15 @@ pub(crate) async fn load_conversation_history_with_cache(
         let conv_id_str = conv_ref.as_id();
         let conv_id = ConversationId::from(conv_id_str);
 
-        // Check if conversation exists - return error if not found
-        let conversation = ctx
-            .conversation_storage
-            .get_conversation(&conv_id)
-            .await
-            .map_err(|e| {
+        // Check if conversation exists - return error if not found. Scope the
+        // read to the request storage-context (same as the response-chain read
+        // above) so tenant/user storage hooks see it outside the middleware scope.
+        let get_conv_fut = ctx.conversation_storage.get_conversation(&conv_id);
+        let conversation = match &ctx.request_context {
+            Some(rc) => data_connector::with_request_context(rc.clone(), get_conv_fut).await,
+            None => get_conv_fut.await,
+        }
+        .map_err(|e| {
                 error::internal_error(
                     "check_conversation_failed",
                     format!("Failed to check conversation: {e}"),
@@ -348,11 +351,12 @@ pub(crate) async fn load_conversation_history_with_cache(
             after: None,
         };
 
-        match ctx
-            .conversation_item_storage
-            .list_items(&conv_id, params)
-            .await
-        {
+        let list_fut = ctx.conversation_item_storage.list_items(&conv_id, params);
+        let list_result = match &ctx.request_context {
+            Some(rc) => data_connector::with_request_context(rc.clone(), list_fut).await,
+            None => list_fut.await,
+        };
+        match list_result {
             Ok(stored_items) => {
                 let mut items: Vec<ResponseInputOutputItem> = Vec::new();
                 for item in stored_items {

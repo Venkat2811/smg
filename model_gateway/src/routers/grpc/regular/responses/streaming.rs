@@ -1087,17 +1087,18 @@ async fn execute_tool_loop_streaming_internal(
             "total_tokens": u.total_tokens
         })
     });
-    if drain_completed {
-        // SSE: drain emitter state (terminal; byte-identical to prior output).
-        let event = emitter.emit_completed(terminal_usage_json.as_ref());
-        emitter.send_event(&event, sink)?;
+    // SSE drains emitter state (terminal, byte-identical to prior output) for a
+    // normal `Completed` turn, but on the early exits (`InProgress`:
+    // function-tool-call / max-tool-calls) it must preserve the explicit status so
+    // clients see the turn is still pending rather than a hardcoded `completed`.
+    // WS always emits with the explicit status (clone) so `finalize_with_status`
+    // below still materializes the full output.
+    let event = if drain_completed && matches!(terminal_status, ResponseStatus::Completed) {
+        emitter.emit_completed(terminal_usage_json.as_ref())
     } else {
-        // WS: explicit terminal status (Completed / InProgress) WITHOUT draining,
-        // so `finalize_with_status` below still materializes the full output.
-        let event = emitter
-            .emit_completed_with_status(terminal_status.clone(), terminal_usage_json.as_ref());
-        emitter.send_event(&event, sink)?;
-    }
+        emitter.emit_completed_with_status(terminal_status.clone(), terminal_usage_json.as_ref())
+    };
+    emitter.send_event(&event, sink)?;
 
     // Materialize the finalized response from the (non-drained) emitter state so
     // the WS connection cache and any persistence see the full output. On the SSE
