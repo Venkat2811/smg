@@ -12,7 +12,7 @@ use std::{
 };
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     http::{header, StatusCode},
     response::Response,
 };
@@ -241,7 +241,27 @@ async fn drive_non_mcp_stream(
                     event_emitter.process_chunk(&chat_chunk, sink)?;
                 }
                 Err(_) => {
-                    // Not a valid chat chunk - might be error event, pass through.
+                    // A non-chat frame carrying an `error` object is an upstream
+                    // worker error. Fail the turn instead of forwarding it: a
+                    // pass-through here would ship the client an error-shaped frame
+                    // AND then a terminal response.completed for the same turn (and
+                    // cache/persist a bogus success). Mirrors the MCP path
+                    // (convert_and_accumulate_stream).
+                    if let Some(message) = serde_json::from_str::<Value>(json_str)
+                        .ok()
+                        .as_ref()
+                        .and_then(|value| value.get("error"))
+                        .map(|error| {
+                            error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("upstream worker stream error")
+                                .to_string()
+                        })
+                    {
+                        return Err(message);
+                    }
+                    // Other non-chat frames (informational) stay pass-through.
                     // Forward the data:-stripped payload (`json_str`), NOT `event`:
                     // `send_raw_json` re-frames as `data: {payload}` for SSE and
                     // sends bare JSON text on WS, so passing the prefixed line would
@@ -318,6 +338,27 @@ pub(crate) async fn execute_non_mcp_stream_with_sink(
             None,
         )
         .await;
+
+    // A non-2xx from the chat pipeline (worker-selection / stage error before any
+    // SSE is produced) carries its error in the body, not as a `data:` frame.
+    // Streaming it would emit response.created/in_progress and then a bogus
+    // response.completed (drive_non_mcp_stream ignores non-`data:` error bodies),
+    // so the client sees success and an empty response is cached/persisted.
+    // Surface it as a failed turn instead.
+    let status = chat_response.status();
+    if !status.is_success() {
+        let body_bytes = to_bytes(chat_response.into_body(), 1_048_576).await.ok();
+        let message = body_bytes
+            .as_ref()
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("chat pipeline returned status {status}"));
+        return Err(message);
+    }
 
     let (_parts, body) = chat_response.into_parts();
 
@@ -1461,28 +1502,27 @@ mod tests {
         );
     }
 
-    /// Regression for the double-`data:` framing bug: a non-chat SSE event (e.g.
-    /// the worker's mid-stream `data: {"error":…}`) fails
+    /// Regression for the double-`data:` framing bug: a non-chat, non-error SSE
+    /// event (an informational/keepalive frame) fails
     /// `ChatCompletionStreamResponse` parsing and is forwarded via
     /// `send_raw_json`. It must be forwarded as the data:-STRIPPED JSON, NOT the
-    /// prefixed line — otherwise `send_raw_json` re-frames it to `data: data: …`
-    /// on SSE (and ships non-JSON text to WS clients). Caught only on the wire
-    /// before this test existed.
+    /// prefixed line, otherwise `send_raw_json` re-frames it to `data: data: …`
+    /// on SSE (and ships non-JSON text to WS clients). (Error frames are handled
+    /// separately now: they fail the turn, see the next test.)
     #[tokio::test]
     async fn drive_non_mcp_stream_forwards_non_chat_events_single_framed() {
         let chunk = ChatCompletionStreamResponse::builder("chatcmpl-x", "test-model")
             .add_choice_content(0, "assistant", "hi")
             .build();
-        let error_json =
-            r#"{"error":{"message":"boom","type":"server_error","code":"internal_error"}}"#;
+        let info_json = r#"{"note":"keepalive","seq":1}"#;
         // Each HTTP body frame is treated as one complete SSE event, so emit the
-        // valid chunk, the non-chat error event, and [DONE] as SEPARATE frames.
+        // valid chunk, the non-chat informational event, and [DONE] as SEPARATE frames.
         let frames: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
             Ok(bytes::Bytes::from(format!(
                 "data: {}\n\n",
                 serde_json::to_string(&chunk).expect("chunk serializes")
             ))),
-            Ok(bytes::Bytes::from(format!("data: {error_json}\n\n"))),
+            Ok(bytes::Bytes::from(format!("data: {info_json}\n\n"))),
             Ok(bytes::Bytes::from("data: [DONE]\n\n")),
         ];
         let body = Body::from_stream(futures_util::stream::iter(frames));
@@ -1503,13 +1543,47 @@ mod tests {
             "exactly one non-chat event should be forwarded, got {raw:?}"
         );
         assert_eq!(
-            raw[0], error_json,
+            raw[0], info_json,
             "non-chat event must be forwarded as stripped JSON (no `data: ` prefix)"
         );
         assert!(
             !raw[0].starts_with("data: "),
             "forwarded payload must not retain the SSE `data: ` prefix (would double-frame), got {:?}",
             raw[0]
+        );
+    }
+
+    /// Regression: a non-MCP turn that hits an upstream `data: {"error":…}` frame
+    /// must FAIL (return Err), not forward the error and then emit
+    /// `response.completed` for the same turn (which would also cache/persist a
+    /// bogus success). Mirrors the MCP path. Benign non-error frames stay
+    /// pass-through (the test above).
+    #[tokio::test]
+    async fn drive_non_mcp_stream_fails_turn_on_error_frame() {
+        let chunk = ChatCompletionStreamResponse::builder("chatcmpl-x", "test-model")
+            .add_choice_content(0, "assistant", "partial")
+            .build();
+        let error_json = r#"{"error":{"message":"worker exploded","type":"server_error","code":"internal_error"}}"#;
+        let frames: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+            Ok(bytes::Bytes::from(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&chunk).expect("chunk serializes")
+            ))),
+            Ok(bytes::Bytes::from(format!("data: {error_json}\n\n"))),
+            Ok(bytes::Bytes::from("data: [DONE]\n\n")),
+        ];
+        let body = Body::from_stream(futures_util::stream::iter(frames));
+        let request = ResponsesRequest {
+            model: "test-model".to_string(),
+            ..Default::default()
+        };
+        let sink = CollectingSink::default();
+        let err = drive_non_mcp_stream(body, &request, &sink, false)
+            .await
+            .expect_err("an upstream error frame must fail the non-MCP turn");
+        assert!(
+            err.contains("worker exploded"),
+            "surfaced error must carry the upstream worker message, got {err:?}"
         );
     }
 
