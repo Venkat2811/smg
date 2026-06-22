@@ -277,15 +277,32 @@ async fn warmup_response_create(
         json!({ "type": "response.completed", "response": response.clone() }),
     )?;
 
-    persist_response_if_needed(
-        ctx.conversation_storage.clone(),
-        ctx.conversation_item_storage.clone(),
-        ctx.response_storage.clone(),
-        &response,
-        request,
-        ctx.request_context.clone(),
-    )
-    .await;
+    // Detached for the same reason as the main path: the session aborts this
+    // executor on client disconnect, and the terminal event is already sent, so
+    // the post-terminal durable write must not be cancelled by that abort.
+    // Detaching also frees the in-flight slot promptly (we do not await a slow
+    // storage write after the turn is complete).
+    let persist_response = response.clone();
+    let persist_request = request.clone();
+    let conversation_storage = ctx.conversation_storage.clone();
+    let conversation_item_storage = ctx.conversation_item_storage.clone();
+    let response_storage = ctx.response_storage.clone();
+    let persist_request_context = ctx.request_context.clone();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "detached so a client disconnect (which aborts the executor task) cannot cancel the durable write for an already-delivered warmup response"
+    )]
+    tokio::spawn(async move {
+        persist_response_if_needed(
+            conversation_storage,
+            conversation_item_storage,
+            response_storage,
+            &persist_response,
+            &persist_request,
+            persist_request_context,
+        )
+        .await;
+    });
 
     Ok(CachedWsResponse {
         response,

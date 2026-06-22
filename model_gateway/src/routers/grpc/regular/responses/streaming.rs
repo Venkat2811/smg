@@ -796,6 +796,27 @@ async fn execute_tool_loop_streaming_internal(
             )
             .await;
 
+        // A non-2xx from the chat pipeline (worker-selection / stage error before
+        // any SSE) carries its error in the body, not a `data:` frame.
+        // convert_and_accumulate_stream only consumes `data:` frames, so the error
+        // body would materialize as an empty success and the loop would
+        // emit/cache/persist a completed turn. Surface it as a failed turn instead
+        // (same guard as the non-MCP path).
+        let status = response.status();
+        if !status.is_success() {
+            let body_bytes = to_bytes(response.into_body(), 1_048_576).await.ok();
+            let message = body_bytes
+                .as_ref()
+                .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+                .as_ref()
+                .and_then(|value| value.get("error"))
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("chat pipeline returned status {status}"));
+            return Err(message);
+        }
+
         // Convert chat stream to Responses API events while accumulating for tool call detection
         // Stream text naturally - it only appears on final iteration (tool iterations have empty content)
         let accumulated_response =
