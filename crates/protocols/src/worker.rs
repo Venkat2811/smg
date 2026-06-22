@@ -215,19 +215,25 @@ impl RuntimeType {
     pub fn is_specified(self) -> bool {
         !matches!(self, RuntimeType::Unspecified)
     }
+
+    /// Static string form, identical to `Display`. For hot-path metric labels
+    /// that must avoid per-call allocation/interning.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuntimeType::Unspecified => "unspecified",
+            RuntimeType::Sglang => "sglang",
+            RuntimeType::Vllm => "vllm",
+            RuntimeType::Trtllm => "trtllm",
+            RuntimeType::Mlx => "mlx",
+            RuntimeType::TokenSpeed => "tokenspeed",
+            RuntimeType::External => "external",
+        }
+    }
 }
 
 impl std::fmt::Display for RuntimeType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RuntimeType::Unspecified => write!(f, "unspecified"),
-            RuntimeType::Sglang => write!(f, "sglang"),
-            RuntimeType::Vllm => write!(f, "vllm"),
-            RuntimeType::Trtllm => write!(f, "trtllm"),
-            RuntimeType::Mlx => write!(f, "mlx"),
-            RuntimeType::TokenSpeed => write!(f, "tokenspeed"),
-            RuntimeType::External => write!(f, "external"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -537,12 +543,12 @@ impl<'de> Deserialize<'de> for WorkerModels {
 
 /// JsonSchema: wire format is `Vec<ModelCard>`.
 impl JsonSchema for WorkerModels {
-    fn schema_name() -> String {
-        "WorkerModels".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "WorkerModels".into()
     }
 
-    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        Vec::<ModelCard>::json_schema(gen)
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        Vec::<ModelCard>::json_schema(generator)
     }
 }
 
@@ -1099,6 +1105,21 @@ pub struct SchedulerLoadSnapshot {
     pub cache_hit_rate: f64,
     pub utilization: f64,
     pub max_running_requests: i32,
+    /// PD disaggregation signals, populated only when the backend reports a
+    /// `disagg` section. `None` for HTTP or older engines. Canonical schema
+    /// other engines map into; SGLang derives the queue depths from its
+    /// per-stage DisaggregationMetrics counters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_transfer_latency_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_transfer_speed_gb_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_queue_reqs: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_queue_reqs: Option<i32>,
+    /// "prefill", "decode", or "null" as reported by the backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disagg_mode: Option<String>,
 }
 
 /// Full load response for a single worker across all DP ranks.

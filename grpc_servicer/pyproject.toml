@@ -8,7 +8,7 @@ version = "0.5.6"
 description = "SMG gRPC servicer implementations for LLM inference engines (vLLM, MLX, TokenSpeed, SGLang)"
 requires-python = ">=3.10"
 dependencies = [
-    "smg-grpc-proto>=0.4.10",
+    "smg-grpc-proto>=0.4.11",
     "grpcio>=1.81.1",
     "grpcio-reflection>=1.81.1",
     "grpcio-health-checking>=1.81.1",
@@ -36,6 +36,9 @@ sglang = ["sglang>=0.5.10"]
 # without this floor, installing [mlx] against an older proto build would
 # crash at import time when smg_grpc_servicer.mlx.server runs.
 mlx = ["smg-grpc-proto>=0.4.7", "mlx>=0.22.0", "mlx-lm>=0.22.0"]
+# TokenSpeed itself is installed from source (no PyPI release); these are the
+# extra runtime deps the KV-event bridge needs on top of a TokenSpeed install.
+tokenspeed = ["pyzmq>=25.0.0", "msgspec>=0.18.0"]
 
 [project.urls]
 Homepage = "https://github.com/lightseekorg/smg"

@@ -175,6 +175,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn runtime_worker_threads(mut self, threads: Option<usize>) -> Self {
+        self.config.runtime_worker_threads = threads;
+        self
+    }
+
     // ==================== Request ====================
 
     pub fn max_payload_size(mut self, size: usize) -> Self {
@@ -199,6 +204,11 @@ impl RouterConfigBuilder {
 
     pub fn load_monitor_interval_secs(mut self, interval: u64) -> Self {
         self.config.load_monitor_interval_secs = interval;
+        self
+    }
+
+    pub fn engine_metrics(mut self, enabled: bool) -> Self {
+        self.config.engine_metrics = enabled;
         self
     }
 

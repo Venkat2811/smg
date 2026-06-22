@@ -23,6 +23,14 @@ set -euo pipefail
 ARM="${1:?usage: launch_arm.sh <a|b|stop>}"
 
 MODEL="${BFCL_MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
+# Load source: prefer a pre-staged local copy at $ROUTER_LOCAL_MODEL_PATH/<id>
+# (e.g. NVMe /raid/models on the Blackwell node — no download); else the HF repo
+# id, which vLLM/HF downloads into HF_HOME. The canonical served name stays
+# $MODEL (passed as --served-model-name) so the BFCL handler + requests match.
+MODEL_SRC="$MODEL"
+if [ -n "${ROUTER_LOCAL_MODEL_PATH:-}" ] && [ -d "$ROUTER_LOCAL_MODEL_PATH/$MODEL" ]; then
+  MODEL_SRC="$ROUTER_LOCAL_MODEL_PATH/$MODEL"
+fi
 GPU="${BFCL_GPU:-0}"                              # CUDA_VISIBLE_DEVICES (e.g. "0" or "0,1")
 TP="${BFCL_TP:-1}"                               # tensor-parallel size (match GPU count)
 MAX_MODEL_LEN="${BFCL_MAX_MODEL_LEN:-16384}"
@@ -33,7 +41,9 @@ RUN_DIR="${BFCL_RUN_DIR:-/tmp/bfcl_ab}"
 VLLM_TOOL_PARSER="${BFCL_VLLM_TOOL_PARSER:-hermes}"
 VLLM_REASONING_PARSER="${BFCL_VLLM_REASONING_PARSER:-}"   # empty = none (non-thinking SKU)
 # SMG (arm B) parser flags — SMG registry names, NOT vLLM's.
-SMG_TOOL_PARSER="${BFCL_SMG_TOOL_PARSER:-qwen}"
+# `-` not `:-`: an explicit empty value passes through (omits the flag → SMG
+# auto-detect, e.g. harmony for gpt-oss); only an unset var defaults to qwen.
+SMG_TOOL_PARSER="${BFCL_SMG_TOOL_PARSER-qwen}"
 SMG_REASONING_PARSER="${BFCL_SMG_REASONING_PARSER:-}"
 
 # Extra args appended to every vLLM process (both arms). e.g.
@@ -48,6 +58,7 @@ VLLM_EXTRA="${BFCL_VLLM_EXTRA:-}"
 ARM_A_PORT="${BFCL_ARM_A_PORT:-}"          # pure-vLLM OpenAI port
 ARM_B_GRPC_PORT="${BFCL_ARM_B_GRPC_PORT:-}" # vLLM gRPC worker port
 ARM_B_GW_PORT="${BFCL_ARM_B_GW_PORT:-}"     # SMG OpenAI gateway port
+ARM_B_METRICS_PORT="${BFCL_ARM_B_METRICS_PORT:-}" # SMG Prometheus port (defaults to 29000 — collides when arms/legs share a host)
 
 # Executables (override for venv / box paths).
 VLLM_BIN="${VLLM_BIN:-vllm}"                      # `vllm serve` console script
@@ -63,6 +74,10 @@ start() {
   echo $! >"$RUN_DIR/$name.pid"
   echo "[launch_arm] started $name (pid $(cat "$RUN_DIR/$name.pid")) -> $log" >&2
 }
+
+# Tail a logfile to stderr (streams live in CI; stdout is reserved for the
+# base_url). Prints the tail pid so the caller can stop it once healthy.
+stream_log() { tail -n +1 -F "$1" >&2 & echo $!; }
 
 wait_http() {  # wait_http <url> <timeout_s>
   local url="$1" timeout="${2:-300}" waited=0
@@ -89,7 +104,7 @@ case "$ARM" in
   a)
     ARM_A_PORT="${ARM_A_PORT:-$(free_port)}"
     declare -a cmd=(
-      CUDA_VISIBLE_DEVICES="$GPU" "$VLLM_BIN" serve "$MODEL"
+      CUDA_VISIBLE_DEVICES="$GPU" "$VLLM_BIN" serve "$MODEL_SRC"
       --served-model-name "$MODEL"
       --enable-auto-tool-choice --tool-call-parser "$VLLM_TOOL_PARSER"
       --host 0.0.0.0 --port "$ARM_A_PORT"
@@ -100,44 +115,69 @@ case "$ARM" in
     # shellcheck disable=SC2206  # intentional word-split of optional extra flags
     [ -n "$VLLM_EXTRA" ] && cmd+=($VLLM_EXTRA)
     start arm_a "$RUN_DIR/arm_a_vllm.log" "${cmd[@]}"
+    log_tail=$(stream_log "$RUN_DIR/arm_a_vllm.log")
     wait_http "http://127.0.0.1:$ARM_A_PORT/health" "${BFCL_STARTUP_TIMEOUT:-420}"
+    kill "$log_tail" 2>/dev/null || true
     echo "http://127.0.0.1:$ARM_A_PORT"
     ;;
 
   b)
     ARM_B_GRPC_PORT="${ARM_B_GRPC_PORT:-$(free_port)}"
     ARM_B_GW_PORT="${ARM_B_GW_PORT:-$(free_port)}"
+    ARM_B_METRICS_PORT="${ARM_B_METRICS_PORT:-$(free_port)}"
     # 1) vLLM gRPC worker (raw-token; SMG will own template+parsing).
     declare -a wcmd=(
       CUDA_VISIBLE_DEVICES="$GPU" "$VLLM_PYTHON" -m vllm.entrypoints.grpc_server
-      --model "$MODEL" --host 0.0.0.0 --port "$ARM_B_GRPC_PORT"
+      --model "$MODEL_SRC" --served-model-name "$MODEL"
+      --host 0.0.0.0 --port "$ARM_B_GRPC_PORT"
       --tensor-parallel-size "$TP" --max-model-len "$MAX_MODEL_LEN"
       --gpu-memory-utilization "$GPU_MEM_UTIL"
     )
     # shellcheck disable=SC2206  # intentional word-split of optional extra flags
     [ -n "$VLLM_EXTRA" ] && wcmd+=($VLLM_EXTRA)
     start arm_b_worker "$RUN_DIR/arm_b_worker.log" "${wcmd[@]}"
+    log_tail=$(stream_log "$RUN_DIR/arm_b_worker.log")
     wait_grpc "$ARM_B_GRPC_PORT" "${BFCL_STARTUP_TIMEOUT:-420}"
+    kill "$log_tail" 2>/dev/null || true
     # 2) SMG gateway in front, exposing the OpenAI API.
+    # shellcheck disable=SC2206  # intentional word-split of SMG_LAUNCH
     declare -a smg_cmd=(
       $SMG_LAUNCH
-      --model-path "$MODEL"
+      --model-path "$MODEL_SRC"
       --worker-urls "grpc://127.0.0.1:$ARM_B_GRPC_PORT"
-      --tool-call-parser "$SMG_TOOL_PARSER"
       --host 0.0.0.0 --port "$ARM_B_GW_PORT"
+      # Free port, not the fixed 29000 default — else a second SMG on the same
+      # host (concurrent arm/leg) panics with "metrics server bind failed".
+      --prometheus-port "$ARM_B_METRICS_PORT"
     )
+    # Empty => omit, so SMG auto-detects (e.g. gpt-oss → harmony pipeline).
+    [ -n "$SMG_TOOL_PARSER" ] && smg_cmd+=(--tool-call-parser "$SMG_TOOL_PARSER")
     [ -n "$SMG_REASONING_PARSER" ] && smg_cmd+=(--reasoning-parser "$SMG_REASONING_PARSER")
     start arm_b_gateway "$RUN_DIR/arm_b_gateway.log" "${smg_cmd[@]}"
+    log_tail=$(stream_log "$RUN_DIR/arm_b_gateway.log")
     wait_http "http://127.0.0.1:$ARM_B_GW_PORT/health" "${BFCL_STARTUP_TIMEOUT:-420}"
+    kill "$log_tail" 2>/dev/null || true
     echo "http://127.0.0.1:$ARM_B_GW_PORT"
     ;;
 
   stop)
+    # Kill each recorded pid's whole PROCESS GROUP (negative pid). start() uses
+    # setsid, so the pid is the group leader; killing only it orphaned vLLM's
+    # worker children, leaving ~250 GiB pinned per GPU across jobs.
+    declare -a pids=()
     for pf in "$RUN_DIR"/*.pid; do
       [ -e "$pf" ] || continue
-      pid="$(cat "$pf")"
-      kill "$pid" 2>/dev/null && echo "[launch_arm] killed $(basename "$pf" .pid) (pid $pid)" >&2 || true
+      pids+=("$(cat "$pf")")
       rm -f "$pf"
+    done
+    [ "${#pids[@]}" -eq 0 ] && exit 0
+    for pid in "${pids[@]}"; do
+      kill -TERM -- -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    done
+    sleep 5  # let them drain on SIGTERM before the hard kill
+    for pid in "${pids[@]}"; do
+      kill -KILL -- -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      echo "[launch_arm] stopped process group $pid" >&2
     done
     ;;
 

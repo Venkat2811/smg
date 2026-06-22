@@ -11,6 +11,7 @@ use smg_auth as auth;
 pub enum PolicyType {
     Random,
     RoundRobin,
+    Passthrough,
     CacheAware,
     PowerOfTwo,
     LeastLoad,
@@ -512,6 +513,7 @@ impl Router {
             Ok(match policy {
                 PolicyType::Random => ConfigPolicyConfig::Random,
                 PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
+                PolicyType::Passthrough => ConfigPolicyConfig::Passthrough,
                 PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
                     cache_threshold: self.cache_threshold,
                     balance_abs_threshold: self.balance_abs_threshold,
@@ -1198,6 +1200,7 @@ impl Router {
                 host: self.host.clone(),
                 port: self.port,
                 health_check_port: self.health_check_port,
+                runtime_worker_threads: None,
                 router_config,
                 max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
@@ -1214,7 +1217,7 @@ impl Router {
                     .map(|c| c.to_auth_control_plane_config()),
                 mesh_server_config: if self.enable_mesh {
                     let self_name = self.mesh_server_name.clone().unwrap_or_else(|| {
-                        use rand::{distr::Alphanumeric, Rng};
+                        use rand::{distr::Alphanumeric, RngExt};
                         let random_string: String = (0..4)
                             .map(|_| rand::rng().sample(Alphanumeric) as char)
                             .collect();

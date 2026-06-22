@@ -6,7 +6,7 @@ use std::{
 };
 
 use openai_protocol::worker::WorkerLoadResponse;
-use rand::Rng;
+use rand::RngExt;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
@@ -168,6 +168,7 @@ mod tests {
                 cache_hit_rate: 0.0,
                 utilization: 0.0,
                 max_running_requests: 0,
+                ..Default::default()
             }],
         }
     }

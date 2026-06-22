@@ -11,8 +11,11 @@
 
 use std::{
     collections::HashMap,
+    io::Write,
+    mem::size_of,
     path::Path,
     sync::{Arc, OnceLock},
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -30,14 +33,17 @@ use openai_protocol::{
     common::ContentPart,
     messages::{ImageSource, InputContent, InputContentBlock, InputMessage, Role},
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::routers::grpc::{
     client::GrpcClient,
     context::WorkerSelection,
     proto_wrapper::{
-        SglangMultimodalData, TensorBytes, TokenSpeedModality, TokenSpeedMultimodalData,
-        TokenSpeedMultimodalItem, TrtllmMultimodalData, VllmMultimodalData,
+        cleanup_tokenspeed_items_encoder_shm, tokenspeed_mm_shm_min_bytes,
+        tokenspeed_mm_tensor_transport_mode, tokenspeed_shm_dev_writable,
+        write_tokenspeed_shm_with, SglangMultimodalData, TensorBytes, TokenSpeedModality,
+        TokenSpeedMultimodalData, TokenSpeedMultimodalItem, TokenSpeedTensor, TrtllmMultimodalData,
+        VllmMultimodalData,
     },
     MultimodalData,
 };
@@ -60,6 +66,12 @@ pub(crate) struct MultimodalModelConfig {
 /// 2. Lazy-loaded from local disk / HF on first multimodal request.
 pub struct MultimodalConfigRegistry {
     configs: DashMap<String, Arc<MultimodalModelConfig>>,
+}
+
+fn log_mm_timing_enabled() -> bool {
+    std::env::var("SMG_LOG_MM_TIMING")
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
 }
 
 impl MultimodalConfigRegistry {
@@ -546,6 +558,9 @@ async fn process_multimodal_parts(
     tokenizer_id: &str,
     tokenizer_source: &str,
 ) -> Result<MultimodalOutput> {
+    let log_timing = log_mm_timing_enabled();
+    let total_started = Instant::now();
+    let media_started = Instant::now();
     let mut tracker = AsyncMultiModalTracker::new(components.media_connector.clone());
 
     for part in content_parts {
@@ -587,6 +602,7 @@ async fn process_multimodal_parts(
         })
         .unwrap_or_default();
 
+    let media_elapsed_ms = media_started.elapsed().as_secs_f64() * 1000.0;
     let modality = match (images.is_empty(), videos.is_empty()) {
         (false, true) => Modality::Image,
         (true, false) => Modality::Video,
@@ -627,6 +643,7 @@ async fn process_multimodal_parts(
     }
 
     // Step 2: Resolve model spec and preprocess media.
+    let config_started = Instant::now();
     let model_config = components
         .config_registry
         .get_or_load(tokenizer_id, tokenizer_source)
@@ -644,6 +661,7 @@ async fn process_multimodal_parts(
         .model_registry
         .lookup(&metadata)
         .ok_or_else(|| anyhow::anyhow!("Multimodal not supported for model: {model_id}"))?;
+    let config_elapsed_ms = config_started.elapsed().as_secs_f64() * 1000.0;
 
     // Run CPU-intensive vision preprocessing on a blocking thread pool so it
     // doesn't block the tokio async runtime under concurrent load.
@@ -661,6 +679,7 @@ async fn process_multimodal_parts(
     let images_for_preprocess = images.clone(); // cheap Arc refcount bumps
     let videos_for_preprocess = videos.clone(); // cheap Arc refcount bumps
 
+    let preprocess_started = Instant::now();
     let preprocessed: PreprocessedEncoderInputs = tokio::task::spawn_blocking(move || {
         let processor = registry
             .find(&model_id_owned, model_type_owned.as_deref())
@@ -727,6 +746,7 @@ async fn process_multimodal_parts(
     })
     .await
     .map_err(|e| anyhow::anyhow!("Preprocessing task panicked: {e}"))??;
+    let preprocess_elapsed_ms = preprocess_started.elapsed().as_secs_f64() * 1000.0;
 
     debug!(
         ?modality,
@@ -736,6 +756,7 @@ async fn process_multimodal_parts(
     );
 
     // Step 3: Compute prompt replacements and expand tokens.
+    let expansion_started = Instant::now();
     let prompt_replacements = spec
         .prompt_replacements_for(&metadata, &preprocessed, modality)
         .map_err(|e| anyhow::anyhow!("Failed to compute prompt replacements: {e}"))?;
@@ -775,6 +796,20 @@ async fn process_multimodal_parts(
         ?placeholder_token_id,
         "Token expansion complete"
     );
+    let expansion_elapsed_ms = expansion_started.elapsed().as_secs_f64() * 1000.0;
+    let image_count = images.len();
+    let video_count = videos.len();
+    let video_frame_count = videos.first().map_or(0, |video| {
+        if video.frames().is_empty() {
+            video
+                .rgb_video()
+                .map_or(0, |rgb_video| rgb_video.frames.len())
+        } else {
+            video.frames().len()
+        }
+    });
+    let original_tokens = token_ids.len();
+    let expanded_tokens = expanded.token_ids.len();
 
     // Step 4: Build lightweight intermediate (defers tensor serialization to assembly)
     let intermediate = MultimodalIntermediate::Precomputed(PrecomputedMultimodalIntermediate {
@@ -788,6 +823,23 @@ async fn process_multimodal_parts(
         field_layouts: spec.field_layouts(),
         keep_on_cpu_keys: spec.keep_on_cpu_keys(),
     });
+
+    if log_timing {
+        info!(
+            modality = ?modality,
+            image_count,
+            video_count,
+            video_frame_count,
+            media_fetch_decode_ms = media_elapsed_ms,
+            config_lookup_ms = config_elapsed_ms,
+            preprocess_ms = preprocess_elapsed_ms,
+            token_expand_ms = expansion_elapsed_ms,
+            total_ms = total_started.elapsed().as_secs_f64() * 1000.0,
+            original_tokens,
+            expanded_tokens,
+            "smg_mm_timing process_multimodal_parts"
+        );
+    }
 
     Ok(MultimodalOutput {
         expanded_token_ids: expanded.token_ids,
@@ -1008,6 +1060,12 @@ fn assemble_tokenspeed(
     intermediate: PrecomputedMultimodalIntermediate,
     workers: Option<&WorkerSelection>,
 ) -> Result<TokenSpeedMultimodalData> {
+    let log_timing = log_mm_timing_enabled();
+    let total_started = Instant::now();
+    // Resolve the multimodal tensor transport once per request: `shm` always on,
+    // `auto` only when the worker is verified to share /dev/shm (matching
+    // namespace token), otherwise inline. See `worker_shares_dev_shm`.
+    let shm_enabled = resolve_tokenspeed_shm_enabled(workers);
     // Use patch-only offsets when available and non-empty; fall back to full structural ranges.
     let encoder_input_dtype = tokenspeed_encoder_input_dtype(intermediate.modality, workers);
     let patch_offsets = intermediate
@@ -1024,39 +1082,84 @@ fn assemble_tokenspeed(
     };
 
     let item_count = precomputed_multimodal_item_count(&intermediate)?;
-    let items = (0..item_count)
-        .map(|item_index| {
-            let item_encoder_input = encoder_input_for_item(
-                &intermediate.preprocessed,
-                &intermediate.field_layouts,
-                item_index,
-            )?;
-            let (encoder_input, encoder_input_shape, encoder_input_dtype) =
-                serialize_array_as_dtype(&item_encoder_input, &encoder_input_dtype);
-            let model_specific_tensors = serialize_model_specific_for_item(
-                &intermediate.preprocessed.model_specific,
-                &intermediate.field_layouts,
-                item_index,
-            )?;
-            let mm_placeholders =
-                placeholders_for_item(item_index, &intermediate.placeholders, &patch_offsets);
-            let content_hash =
-                content_hash_for_item(intermediate.modality, &intermediate, item_index);
+    // Build items imperatively so that if any step fails partway we can unlink
+    // the /dev/shm segments already created for prior items' encoder inputs
+    // (and this item's, once created). `?`/`collect` would drop those
+    // `TokenSpeedTensor::Shm` handles without ever reaching the send-path
+    // cleanup, leaking files until the next sweep.
+    let mut items: Vec<TokenSpeedMultimodalItem> = Vec::with_capacity(item_count);
+    for item_index in 0..item_count {
+        let item_encoder_input = match encoder_input_for_item(
+            &intermediate.preprocessed,
+            &intermediate.field_layouts,
+            item_index,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                cleanup_tokenspeed_items_encoder_shm(&items, None);
+                return Err(error);
+            }
+        };
+        let encoder_input_started = Instant::now();
+        let encoder_input = serialize_array_as_tokenspeed_tensor(
+            &item_encoder_input,
+            &encoder_input_dtype,
+            shm_enabled,
+        );
+        let encoder_input_serialize_ms = encoder_input_started.elapsed().as_secs_f64() * 1000.0;
+        let model_specific_started = Instant::now();
+        let model_specific_tensors = match serialize_model_specific_for_item(
+            &intermediate.preprocessed.model_specific,
+            &intermediate.field_layouts,
+            item_index,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                // `encoder_input` (possibly SHM) was created for this item but the
+                // item isn't built; clean it plus all prior items.
+                cleanup_tokenspeed_items_encoder_shm(&items, Some(&encoder_input));
+                return Err(error);
+            }
+        };
+        let model_specific_serialize_ms = model_specific_started.elapsed().as_secs_f64() * 1000.0;
+        let mm_placeholders =
+            placeholders_for_item(item_index, &intermediate.placeholders, &patch_offsets);
+        let content_hash = content_hash_for_item(intermediate.modality, &intermediate, item_index);
 
-            Ok(TokenSpeedMultimodalItem {
-                modality,
-                encoder_input,
-                encoder_input_shape,
-                encoder_input_dtype,
-                model_specific_tensors,
-                placeholder_token_id: intermediate.placeholder_token_id,
-                mm_placeholders,
-                content_hash,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+        if log_timing {
+            info!(
+                modality = ?modality,
+                item_index,
+                encoder_input_dtype = %encoder_input.dtype,
+                encoder_input_bytes = encoder_input.nbytes(),
+                encoder_input_shape = ?encoder_input.shape,
+                model_specific_tensor_count = model_specific_tensors.len(),
+                encoder_input_serialize_ms,
+                model_specific_serialize_ms,
+                "smg_mm_timing assemble_tokenspeed_item"
+            );
+        }
 
-    Ok(TokenSpeedMultimodalData { items })
+        items.push(TokenSpeedMultimodalItem {
+            modality,
+            encoder_input,
+            model_specific_tensors,
+            placeholder_token_id: intermediate.placeholder_token_id,
+            mm_placeholders,
+            content_hash,
+        });
+    }
+
+    if log_timing {
+        info!(
+            modality = ?modality,
+            item_count = items.len(),
+            total_ms = total_started.elapsed().as_secs_f64() * 1000.0,
+            "smg_mm_timing assemble_tokenspeed"
+        );
+    }
+
+    Ok(TokenSpeedMultimodalData { items, shm_enabled })
 }
 
 fn precomputed_multimodal_item_count(
@@ -1242,8 +1345,12 @@ fn serialize_encoder_input(preprocessed: &PreprocessedEncoderInputs) -> (Vec<u8>
 
 fn serialize_array(encoder_input: &ArrayD<f32>) -> (Vec<u8>, Vec<u32>) {
     let encoder_bytes: Vec<u8> = if let Some(encoder_slice) = encoder_input
+        // Fast path only for C-contiguous arrays, whose memory order equals
+        // logical (row-major) order. A non-C-contiguous array (e.g. a
+        // Fortran-contiguous view) falls through to logical `.iter()` below;
+        // `as_slice_memory_order()` is deliberately NOT used as a fallback
+        // because it would serialize such arrays in the wrong dimension order.
         .as_slice()
-        .or_else(|| encoder_input.as_slice_memory_order())
     {
         // Zero-copy reinterpret: &[f32] → &[u8] on little-endian (x86).
         // This replaces the per-element flat_map(to_le_bytes) which was the
@@ -1258,12 +1365,183 @@ fn serialize_array(encoder_input: &ArrayD<f32>) -> (Vec<u8>, Vec<u32>) {
             encoder_slice.iter().flat_map(|v| v.to_le_bytes()).collect()
         }
     } else {
-        // Non-C-contiguous array: .iter() walks in logical (row-major) order,
-        // which matches the shape — unlike as_slice_memory_order() which would
-        // silently serialize in wrong dimension order for Fortran-contiguous arrays.
+        // Non-C-contiguous array: `.iter()` walks in logical (row-major) order,
+        // which matches the shape.
         encoder_input.iter().flat_map(|v| v.to_le_bytes()).collect()
     };
     (encoder_bytes, array_shape(encoder_input))
+}
+
+/// Serialize encoder input to the requested wire dtype.
+fn serialize_array_as_tokenspeed_tensor(
+    encoder_input: &ArrayD<f32>,
+    dtype: &str,
+    shm_enabled: bool,
+) -> TokenSpeedTensor {
+    let dtype = match canonical_float_dtype(dtype).as_deref() {
+        Some("float32") => "float32".to_string(),
+        Some("bfloat16") => "bfloat16".to_string(),
+        Some("float16") => "float16".to_string(),
+        _ => {
+            warn!(
+                dtype,
+                "Unsupported TokenSpeed encoder input dtype; falling back to float32"
+            );
+            "float32".to_string()
+        }
+    };
+    let shape = array_shape(encoder_input);
+    let element_size = if dtype == "bfloat16" || dtype == "float16" {
+        size_of::<u16>()
+    } else {
+        size_of::<f32>()
+    };
+    let nbytes = encoder_input.len() * element_size;
+
+    if shm_enabled && nbytes >= tokenspeed_mm_shm_min_bytes() {
+        let started = Instant::now();
+        match write_tokenspeed_shm_with(nbytes, |file| {
+            write_array_as_dtype(file, encoder_input, &dtype)
+        }) {
+            Ok(handle) => {
+                if log_mm_timing_enabled() {
+                    info!(
+                        nbytes,
+                        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                        "smg_mm_timing tokenspeed_shm_write_direct"
+                    );
+                }
+                return TokenSpeedTensor::shm(handle, shape, dtype);
+            }
+            Err(error) => {
+                use crate::observability::metrics::Metrics;
+                warn!(
+                    ?error,
+                    nbytes,
+                    dtype = %dtype,
+                    "Failed to write TokenSpeed encoder input directly to SHM; falling back to bytes path"
+                );
+                Metrics::record_mm_shm_write_failure("tokenspeed");
+            }
+        }
+    }
+
+    let (data, shape, dtype) = serialize_array_as_dtype(encoder_input, &dtype);
+    TokenSpeedTensor::inline(data, shape, dtype)
+}
+
+fn write_array_as_dtype(
+    writer: &mut impl Write,
+    encoder_input: &ArrayD<f32>,
+    dtype: &str,
+) -> std::io::Result<()> {
+    match dtype {
+        "float32" => write_array_as_f32(writer, encoder_input),
+        "bfloat16" => write_array_as_u16(writer, encoder_input, f32_to_bf16_bits),
+        "float16" => write_array_as_u16(writer, encoder_input, f32_to_f16_bits),
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsupported TokenSpeed encoder input dtype: {other}"),
+        )),
+    }
+}
+
+fn write_array_as_f32(writer: &mut impl Write, encoder_input: &ArrayD<f32>) -> std::io::Result<()> {
+    if let Some(encoder_slice) = encoder_input
+        // Fast path only for C-contiguous arrays, whose memory order equals
+        // logical (row-major) order. A non-C-contiguous array (e.g. a
+        // Fortran-contiguous view) falls through to logical `.iter()` below;
+        // `as_slice_memory_order()` is deliberately NOT used as a fallback
+        // because it would serialize such arrays in the wrong dimension order.
+        .as_slice()
+    {
+        return write_f32_slice(writer, encoder_slice);
+    }
+
+    for value in encoder_input {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn write_f32_slice(writer: &mut impl Write, values: &[f32]) -> std::io::Result<()> {
+    #[cfg(target_endian = "little")]
+    {
+        writer.write_all(bytemuck::cast_slice(values))
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for value in values {
+            writer.write_all(&value.to_le_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+fn write_array_as_u16<F>(
+    writer: &mut impl Write,
+    encoder_input: &ArrayD<f32>,
+    convert: F,
+) -> std::io::Result<()>
+where
+    F: Fn(f32) -> u16 + Copy,
+{
+    // Convert in bounded chunks so peak memory stays at ~CHUNK_VALUES u16s
+    // regardless of tensor size, on both the contiguous and strided paths.
+    const CHUNK_VALUES: usize = 256 * 1024;
+
+    if let Some(encoder_slice) = encoder_input
+        // Fast path only for C-contiguous arrays, whose memory order equals
+        // logical (row-major) order. A non-C-contiguous array (e.g. a
+        // Fortran-contiguous view) falls through to logical `.iter()` below;
+        // `as_slice_memory_order()` is deliberately NOT used as a fallback
+        // because it would serialize such arrays in the wrong dimension order.
+        .as_slice()
+    {
+        let mut converted: Vec<u16> = Vec::with_capacity(CHUNK_VALUES.min(encoder_slice.len()));
+        for chunk in encoder_slice.chunks(CHUNK_VALUES) {
+            converted.clear();
+            converted.extend(chunk.iter().map(|&value| convert(value)));
+            #[cfg(target_endian = "little")]
+            {
+                writer.write_all(bytemuck::cast_slice(converted.as_slice()))?;
+            }
+            #[cfg(not(target_endian = "little"))]
+            {
+                for value in &converted {
+                    writer.write_all(&value.to_le_bytes())?;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let mut converted = Vec::with_capacity(CHUNK_VALUES);
+    let mut flush = |converted: &mut Vec<u16>| -> std::io::Result<()> {
+        if converted.is_empty() {
+            return Ok(());
+        }
+        #[cfg(target_endian = "little")]
+        {
+            writer.write_all(bytemuck::cast_slice(converted.as_slice()))?;
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            for value in converted.iter() {
+                writer.write_all(&value.to_le_bytes())?;
+            }
+        }
+        converted.clear();
+        Ok(())
+    };
+
+    for &value in encoder_input {
+        converted.push(convert(value));
+        if converted.len() == CHUNK_VALUES {
+            flush(&mut converted)?;
+        }
+    }
+    flush(&mut converted)
 }
 
 fn serialize_array_as_dtype(
@@ -1276,18 +1554,12 @@ fn serialize_array_as_dtype(
             (data, shape, "float32".to_string())
         }
         Some("bfloat16") => (
-            encoder_input
-                .iter()
-                .flat_map(|value| f32_to_bf16_bits(*value).to_le_bytes())
-                .collect(),
+            serialize_array_as_u16_bytes(encoder_input, f32_to_bf16_bits),
             array_shape(encoder_input),
             "bfloat16".to_string(),
         ),
         Some("float16") => (
-            encoder_input
-                .iter()
-                .flat_map(|value| f32_to_f16_bits(*value).to_le_bytes())
-                .collect(),
+            serialize_array_as_u16_bytes(encoder_input, f32_to_f16_bits),
             array_shape(encoder_input),
             "float16".to_string(),
         ),
@@ -1299,6 +1571,40 @@ fn serialize_array_as_dtype(
             let (data, shape) = serialize_array(encoder_input);
             (data, shape, "float32".to_string())
         }
+    }
+}
+
+fn serialize_array_as_u16_bytes<F>(encoder_input: &ArrayD<f32>, convert: F) -> Vec<u8>
+where
+    F: Fn(f32) -> u16 + Copy,
+{
+    let element_count = encoder_input.len();
+    let mut converted = Vec::with_capacity(element_count);
+
+    if let Some(encoder_slice) = encoder_input
+        // Fast path only for C-contiguous arrays, whose memory order equals
+        // logical (row-major) order. A non-C-contiguous array (e.g. a
+        // Fortran-contiguous view) falls through to logical `.iter()` below;
+        // `as_slice_memory_order()` is deliberately NOT used as a fallback
+        // because it would serialize such arrays in the wrong dimension order.
+        .as_slice()
+    {
+        converted.extend(encoder_slice.iter().map(|&value| convert(value)));
+    } else {
+        converted.extend(encoder_input.iter().map(|&value| convert(value)));
+    }
+
+    #[cfg(target_endian = "little")]
+    {
+        bytemuck::cast_slice(&converted).to_vec()
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut bytes = Vec::with_capacity(element_count * std::mem::size_of::<u16>());
+        for value in converted {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
     }
 }
 
@@ -1352,6 +1658,102 @@ fn tokenspeed_encoder_input_dtype_from_worker(workers: Option<&WorkerSelection>)
         .cloned()
 }
 
+/// Resolve whether large multimodal tensors should use the SHM transport for
+/// this request. `shm` = always (legacy explicit opt-in); `auto` = only when the
+/// worker is known to share SMG's `/dev/shm`; anything else (including unset or
+/// `inline`) keeps the inline gRPC path.
+fn resolve_tokenspeed_shm_enabled(workers: Option<&WorkerSelection>) -> bool {
+    let mode = tokenspeed_mm_tensor_transport_mode();
+    log_tokenspeed_transport_config_once(&mode);
+    match mode.as_str() {
+        // SHM only ever happens when SMG can actually write /dev/shm.
+        "shm" => tokenspeed_shm_dev_writable(),
+        "auto" => worker_shares_dev_shm(workers) && tokenspeed_shm_dev_writable(),
+        "" | "inline" => false,
+        other => {
+            log_unknown_tokenspeed_transport_once(other);
+            false
+        }
+    }
+}
+
+fn log_tokenspeed_transport_config_once(mode: &str) {
+    static LOGGED: OnceLock<()> = OnceLock::new();
+    LOGGED.get_or_init(|| {
+        info!(
+            mode,
+            shm_min_bytes = tokenspeed_mm_shm_min_bytes(),
+            dev_writable = tokenspeed_shm_dev_writable(),
+            "TokenSpeed multimodal tensor transport configured"
+        );
+    });
+}
+
+fn log_unknown_tokenspeed_transport_once(value: &str) {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    WARNED.get_or_init(|| {
+        warn!(
+            value,
+            "Unknown SMG_TOKENSPEED_MM_TENSOR_TRANSPORT value; expected inline|shm|auto, using inline"
+        );
+    });
+}
+
+/// Whether the worker is *verified* to share SMG's `/dev/shm`, making the SHM
+/// transport safe under `auto`.
+///
+/// Rather than inferring locality from the worker URL (TCP loopback proves only
+/// network locality, not a shared `/dev/shm`), the worker advertises its
+/// `/dev/shm` filesystem identity (`<boot_id>:<st_dev of /dev/shm>`) via
+/// `GetServerInfo`, which discovery stores in the worker's `shm_namespace_id`
+/// label. Two processes share `/dev/shm` iff these tokens match: `boot_id` pins
+/// the host, and `st_dev` is the tmpfs superblock device, identical whenever the
+/// same tmpfs backs both `/dev/shm` mounts — including separate containers that
+/// share it via `--ipc`/bind-mount (where mount-namespace inodes differ but the
+/// underlying superblock is the same). We compare the worker's token to ours:
+/// equal ⇒ shared. A missing/empty token or any mismatch is treated as
+/// non-sharing, so `auto` safely falls back to inline.
+fn worker_shares_dev_shm(workers: Option<&WorkerSelection>) -> bool {
+    let Some(local) = local_shm_namespace_id() else {
+        return false;
+    };
+    let worker = match workers {
+        Some(WorkerSelection::Single { worker }) => worker,
+        Some(WorkerSelection::Dual { prefill, .. }) => prefill,
+        None => return false,
+    };
+    worker
+        .metadata()
+        .spec
+        .labels
+        .get("shm_namespace_id")
+        .is_some_and(|id| !id.is_empty() && id == local)
+}
+
+/// This process's `/dev/shm` filesystem identity: `<boot_id>:<st_dev of /dev/shm>`.
+/// `boot_id` pins the host (it is not namespaced) and `st_dev` is the tmpfs
+/// superblock device backing `/dev/shm`; together they identify the tmpfs so two
+/// processes sharing it (even across containers via `--ipc`/bind-mount) produce
+/// the same token. Computed once; `None` if it can't be determined (then `auto`
+/// stays inline).
+fn local_shm_namespace_id() -> Option<&'static str> {
+    static ID: OnceLock<Option<String>> = OnceLock::new();
+    ID.get_or_init(compute_shm_namespace_id).as_deref()
+}
+
+#[cfg(unix)]
+fn compute_shm_namespace_id() -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let shm_dev = std::fs::metadata("/dev/shm").ok()?.dev();
+    Some(format!("{}:{shm_dev}", boot_id.trim()))
+}
+
+#[cfg(not(unix))]
+fn compute_shm_namespace_id() -> Option<String> {
+    None
+}
+
 fn canonical_float_dtype(dtype: &str) -> Option<String> {
     match dtype.trim().to_ascii_lowercase().as_str() {
         "float32" | "fp32" | "f32" => Some("float32".to_string()),
@@ -1365,6 +1767,7 @@ fn array_shape(encoder_input: &ArrayD<f32>) -> Vec<u32> {
     encoder_input.shape().iter().map(|&d| d as u32).collect()
 }
 
+#[inline]
 fn f32_to_bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let lsb = (bits >> 16) & 1;
@@ -1372,6 +1775,7 @@ fn f32_to_bf16_bits(value: f32) -> u16 {
     (bits.wrapping_add(rounding_bias) >> 16) as u16
 }
 
+#[inline]
 fn f32_to_f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
@@ -1475,6 +1879,24 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn local_shm_namespace_id_resolves_on_linux() {
+        // /proc/.../boot_id and /dev/shm both exist on the Linux CI/runtime
+        // image, so the token must resolve to `<boot_id>:<st_dev>`. If it ever
+        // returned None, `auto` would silently never enable SHM.
+        let id = local_shm_namespace_id().expect("shm namespace id should resolve on Linux");
+        assert!(
+            id.contains(':'),
+            "token must be <boot_id>:<st_dev>, got {id:?}"
+        );
+        let dev = id.rsplit(':').next().unwrap();
+        assert!(
+            dev.parse::<u64>().is_ok(),
+            "st_dev component must be numeric, got {id:?}"
+        );
+    }
 
     #[test]
     fn test_has_multimodal_content_with_images() {
@@ -1761,8 +2183,8 @@ mod tests {
 
         let first = &assembled.items[0];
         assert_eq!(first.modality, TokenSpeedModality::Image);
-        assert_eq!(first.encoder_input_shape, vec![2, 2]);
-        assert_eq!(first.encoder_input.len(), 4 * size_of::<f32>());
+        assert_eq!(first.encoder_input.shape, vec![2, 2]);
+        assert_eq!(first.encoder_input.nbytes(), 4 * size_of::<f32>());
         assert_eq!(first.mm_placeholders, vec![(10, 2)]);
         assert_eq!(
             first.content_hash,
@@ -1778,7 +2200,7 @@ mod tests {
         );
 
         let second = &assembled.items[1];
-        assert_eq!(second.encoder_input_shape, vec![2, 2]);
+        assert_eq!(second.encoder_input.shape, vec![2, 2]);
         assert_eq!(second.mm_placeholders, vec![(20, 2)]);
         assert_eq!(
             second.content_hash,
@@ -1867,8 +2289,8 @@ mod tests {
 
         let first = &assembled.items[0];
         assert_eq!(first.modality, TokenSpeedModality::Video);
-        assert_eq!(first.encoder_input_shape, vec![2, 2]);
-        assert_eq!(first.encoder_input.len(), 4 * size_of::<f32>());
+        assert_eq!(first.encoder_input.shape, vec![2, 2]);
+        assert_eq!(first.encoder_input.nbytes(), 4 * size_of::<f32>());
         assert_eq!(first.mm_placeholders, vec![(30, 2)]);
         assert_eq!(
             first.content_hash,
@@ -1884,7 +2306,7 @@ mod tests {
         );
 
         let second = &assembled.items[1];
-        assert_eq!(second.encoder_input_shape, vec![2, 2]);
+        assert_eq!(second.encoder_input.shape, vec![2, 2]);
         assert_eq!(second.mm_placeholders, vec![(40, 2)]);
         assert_eq!(
             second.content_hash,

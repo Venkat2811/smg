@@ -24,12 +24,22 @@ pub struct RouterConfig {
     /// routes always remain available on the main `port` regardless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_port: Option<u16>,
+    /// Explicit async runtime worker-thread count. `None` uses tokio's default
+    /// (`available_parallelism()`), which already honors the cgroup CPU quota on
+    /// Rust 1.95+ and is therefore container-aware. `Some` pins a count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_worker_threads: Option<usize>,
     pub max_payload_size: usize,
     pub request_timeout_secs: u64,
     pub worker_startup_timeout_secs: u64,
     pub worker_startup_check_interval_secs: u64,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// Re-export engine `GetLoads` signals as `smg_engine_*` gauges, polling
+    /// even when no load-aware routing policy is active. Decouples engine
+    /// observability from routing.
+    #[serde(default)]
+    pub engine_metrics: bool,
     pub dp_aware: bool,
     #[serde(default)]
     pub dp_minimum_tokens_scheduler: bool,
@@ -303,6 +313,12 @@ pub enum PolicyConfig {
     #[serde(rename = "round_robin")]
     RoundRobin,
 
+    /// Forward every request to the single backend with no load balancing,
+    /// load monitoring, or KV-event subscription. Intended for single-worker
+    /// gateways. See `policies/passthrough.rs`.
+    #[serde(rename = "passthrough")]
+    Passthrough,
+
     #[serde(rename = "cache_aware")]
     CacheAware {
         cache_threshold: f32,
@@ -445,6 +461,7 @@ impl PolicyConfig {
         match self {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
+            PolicyConfig::Passthrough => "passthrough",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::LeastLoad { .. } => "least_load",
@@ -645,11 +662,13 @@ impl Default for RouterConfig {
             host: "0.0.0.0".to_string(),
             port: 3001,
             health_check_port: None,
+            runtime_worker_threads: None,
             max_payload_size: 536_870_912,     // 512MB
             request_timeout_secs: 1800,        // 30 minutes
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_check_interval_secs: 30,
             load_monitor_interval_secs: 10,
+            engine_metrics: false,
             dp_aware: false,
             dp_minimum_tokens_scheduler: false,
             api_key: None,
@@ -947,6 +966,7 @@ mod tests {
     fn test_policy_config_name() {
         assert_eq!(PolicyConfig::Random.name(), "random");
         assert_eq!(PolicyConfig::RoundRobin.name(), "round_robin");
+        assert_eq!(PolicyConfig::Passthrough.name(), "passthrough");
 
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,

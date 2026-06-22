@@ -33,6 +33,14 @@ pub struct SglangSchedulerClient {
     trace_injector: BoxedTraceInjector,
 }
 
+/// Optional request data used when building SGLang generation requests.
+#[derive(Default)]
+pub struct SglangGenerateRequestOptions {
+    pub multimodal_inputs: Option<proto::MultimodalInputs>,
+    pub tool_call_constraint: Option<(String, String)>,
+    pub require_reasoning: bool,
+}
+
 impl AbortOnDropClient for SglangSchedulerClient {
     fn abort_for_drop(
         self,
@@ -175,12 +183,27 @@ impl SglangSchedulerClient {
         body: &ChatCompletionRequest,
         processed_text: String,
         token_ids: Vec<u32>,
-        multimodal_inputs: Option<proto::MultimodalInputs>,
-        tool_call_constraint: Option<(String, String)>, // (constraint_type, constraint_value)
+        options: SglangGenerateRequestOptions,
+    ) -> Result<proto::GenerateRequest, String> {
+        Self::build_generate_request_from_chat_parts(
+            request_id,
+            body,
+            processed_text,
+            token_ids,
+            options,
+        )
+    }
+
+    fn build_generate_request_from_chat_parts(
+        request_id: String,
+        body: &ChatCompletionRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        options: SglangGenerateRequestOptions,
     ) -> Result<proto::GenerateRequest, String> {
         // Build sampling params
         let sampling_params =
-            Self::build_grpc_sampling_params_from_chat(body, tool_call_constraint)?;
+            Self::build_grpc_sampling_params_from_chat(body, options.tool_call_constraint)?;
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -188,13 +211,14 @@ impl SglangSchedulerClient {
                 original_text: processed_text,
                 input_ids: token_ids,
             }),
-            mm_inputs: multimodal_inputs,
+            mm_inputs: options.multimodal_inputs,
             sampling_params: Some(sampling_params),
             return_logprob: body.logprobs,
             logprob_start_len: -1,
             top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
             return_hidden_states: body.return_hidden_states,
             stream: body.stream,
+            require_reasoning: options.require_reasoning,
             ..Default::default()
         };
 
@@ -213,8 +237,22 @@ impl SglangSchedulerClient {
         original_text: Option<String>,
         token_ids: Vec<u32>,
     ) -> Result<proto::GenerateRequest, String> {
+        Self::build_plain_generate_request_parts(request_id, body, original_text, token_ids)
+    }
+
+    fn build_plain_generate_request_parts(
+        request_id: String,
+        body: &GenerateRequest,
+        original_text: Option<String>,
+        token_ids: Vec<u32>,
+    ) -> Result<proto::GenerateRequest, String> {
         let sampling_params =
             Self::build_sampling_params_from_plain(body.sampling_params.as_ref())?;
+        let require_reasoning = body
+            .other
+            .get("require_reasoning")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -230,6 +268,7 @@ impl SglangSchedulerClient {
             return_hidden_states: body.return_hidden_states,
             stream: body.stream,
             log_metrics: body.log_metrics,
+            require_reasoning,
             ..Default::default()
         };
 
@@ -269,6 +308,7 @@ impl SglangSchedulerClient {
             top_logprobs_num: 0,
             return_hidden_states: false,
             stream: body.stream.unwrap_or(false),
+            require_reasoning: false,
             ..Default::default()
         };
 
@@ -451,11 +491,26 @@ impl SglangSchedulerClient {
         body: &CreateMessageRequest,
         processed_text: String,
         token_ids: Vec<u32>,
-        multimodal_inputs: Option<proto::MultimodalInputs>,
-        tool_call_constraint: Option<(String, String)>,
+        options: SglangGenerateRequestOptions,
+    ) -> Result<proto::GenerateRequest, String> {
+        Self::build_generate_request_from_messages_parts(
+            request_id,
+            body,
+            processed_text,
+            token_ids,
+            options,
+        )
+    }
+
+    fn build_generate_request_from_messages_parts(
+        request_id: String,
+        body: &CreateMessageRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        options: SglangGenerateRequestOptions,
     ) -> Result<proto::GenerateRequest, String> {
         let sampling_params =
-            Self::build_grpc_sampling_params_from_messages(body, tool_call_constraint)?;
+            Self::build_grpc_sampling_params_from_messages(body, options.tool_call_constraint)?;
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -463,13 +518,14 @@ impl SglangSchedulerClient {
                 original_text: processed_text,
                 input_ids: token_ids,
             }),
-            mm_inputs: multimodal_inputs,
+            mm_inputs: options.multimodal_inputs,
             sampling_params: Some(sampling_params),
             return_logprob: false,
             logprob_start_len: -1,
             top_logprobs_num: 0,
             return_hidden_states: false,
             stream: body.stream.unwrap_or(false),
+            require_reasoning: options.require_reasoning,
             ..Default::default()
         };
 
@@ -534,6 +590,7 @@ impl SglangSchedulerClient {
             top_logprobs_num: body.logprobs.unwrap_or(0) as i32,
             return_hidden_states: body.return_hidden_states,
             stream: body.stream,
+            require_reasoning: false,
             ..Default::default()
         };
 
@@ -700,6 +757,10 @@ impl SglangSchedulerClient {
 
 impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapshot {
     fn from(load: proto::SchedulerLoad) -> Self {
+        // Disaggregation queue depths roll the per-stage SGLang counters into
+        // the two canonical totals: prefill = prealloc + inflight, decode =
+        // prealloc + transfer + retracted.
+        let disagg = load.disaggregation;
         Self {
             dp_rank: load.dp_rank,
             num_running_reqs: load.num_running_reqs,
@@ -713,6 +774,18 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             cache_hit_rate: load.cache_hit_rate,
             utilization: load.utilization,
             max_running_requests: load.max_running_requests,
+            kv_transfer_latency_ms: disagg.as_ref().map(|d| d.kv_transfer_latency_ms),
+            kv_transfer_speed_gb_s: disagg.as_ref().map(|d| d.kv_transfer_speed_gb_s),
+            prefill_queue_reqs: disagg.as_ref().map(|d| {
+                d.prefill_prealloc_queue_reqs
+                    .saturating_add(d.prefill_inflight_queue_reqs)
+            }),
+            decode_queue_reqs: disagg.as_ref().map(|d| {
+                d.decode_prealloc_queue_reqs
+                    .saturating_add(d.decode_transfer_queue_reqs)
+                    .saturating_add(d.decode_retracted_queue_reqs)
+            }),
+            disagg_mode: disagg.map(|d| d.mode),
         }
     }
 }
@@ -729,12 +802,54 @@ impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadRespon
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
     fn test_proto_types_compilation() {
         let _health_req = proto::HealthCheckRequest {};
         // HealthCheckRequest is now empty - no fields to test
+    }
+
+    #[test]
+    fn test_scheduler_load_maps_disagg_section() {
+        let load = proto::SchedulerLoad {
+            dp_rank: 0,
+            num_running_reqs: 3,
+            disaggregation: Some(proto::DisaggregationMetrics {
+                mode: "prefill".to_string(),
+                prefill_prealloc_queue_reqs: 2,
+                prefill_inflight_queue_reqs: 5,
+                decode_prealloc_queue_reqs: 1,
+                decode_transfer_queue_reqs: 4,
+                decode_retracted_queue_reqs: 7,
+                kv_transfer_speed_gb_s: 12.5,
+                kv_transfer_latency_ms: 3.25,
+            }),
+            ..Default::default()
+        };
+
+        let snap = openai_protocol::worker::SchedulerLoadSnapshot::from(load);
+
+        assert_eq!(snap.disagg_mode.as_deref(), Some("prefill"));
+        assert_eq!(snap.kv_transfer_latency_ms, Some(3.25));
+        assert_eq!(snap.kv_transfer_speed_gb_s, Some(12.5));
+        assert_eq!(snap.prefill_queue_reqs, Some(7)); // 2 + 5
+        assert_eq!(snap.decode_queue_reqs, Some(12)); // 1 + 4 + 7
+    }
+
+    #[test]
+    fn test_scheduler_load_disagg_absent_is_none() {
+        let snap = openai_protocol::worker::SchedulerLoadSnapshot::from(proto::SchedulerLoad {
+            num_running_reqs: 1,
+            ..Default::default()
+        });
+
+        assert!(snap.disagg_mode.is_none());
+        assert!(snap.kv_transfer_latency_ms.is_none());
+        assert!(snap.prefill_queue_reqs.is_none());
+        assert!(snap.decode_queue_reqs.is_none());
     }
 
     #[test]
@@ -869,6 +984,98 @@ mod tests {
             SglangSchedulerClient::build_grpc_sampling_params_from_responses(&disabled, None)
                 .expect("build sampling params");
         assert_eq!(disabled_params.top_k, -1);
+    }
+
+    #[test]
+    fn test_plain_generate_request_forwards_require_reasoning_bool_only() {
+        let enabled: GenerateRequest = serde_json::from_value(json!({
+            "text": "hello",
+            "require_reasoning": true
+        }))
+        .expect("parse generate request");
+        let enabled_proto = SglangSchedulerClient::build_plain_generate_request_parts(
+            "enabled".to_string(),
+            &enabled,
+            Some("hello".into()),
+            vec![1],
+        )
+        .expect("build request");
+        assert!(enabled_proto.require_reasoning);
+
+        let disabled: GenerateRequest = serde_json::from_value(json!({
+            "text": "hello",
+            "require_reasoning": false
+        }))
+        .expect("parse generate request");
+        let disabled_proto = SglangSchedulerClient::build_plain_generate_request_parts(
+            "disabled".to_string(),
+            &disabled,
+            Some("hello".into()),
+            vec![1],
+        )
+        .expect("build request");
+        assert!(!disabled_proto.require_reasoning);
+
+        let non_bool: GenerateRequest = serde_json::from_value(json!({
+            "text": "hello",
+            "require_reasoning": "true"
+        }))
+        .expect("parse generate request");
+        let non_bool_proto = SglangSchedulerClient::build_plain_generate_request_parts(
+            "non-bool".to_string(),
+            &non_bool,
+            Some("hello".into()),
+            vec![1],
+        )
+        .expect("build request");
+        assert!(!non_bool_proto.require_reasoning);
+    }
+
+    #[test]
+    fn test_chat_options_forward_require_reasoning() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .expect("parse chat request");
+
+        let proto = SglangSchedulerClient::build_generate_request_from_chat_parts(
+            "chat".to_string(),
+            &request,
+            "hello".to_string(),
+            vec![1],
+            SglangGenerateRequestOptions {
+                require_reasoning: true,
+                ..Default::default()
+            },
+        )
+        .expect("build request");
+
+        assert!(proto.require_reasoning);
+    }
+
+    #[test]
+    fn test_messages_options_forward_require_reasoning() {
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16
+        }))
+        .expect("parse messages request");
+
+        let proto = SglangSchedulerClient::build_generate_request_from_messages_parts(
+            "messages".to_string(),
+            &request,
+            "hello".to_string(),
+            vec![1],
+            SglangGenerateRequestOptions {
+                require_reasoning: true,
+                ..Default::default()
+            },
+        )
+        .expect("build request");
+
+        assert!(proto.require_reasoning);
     }
 
     #[test]

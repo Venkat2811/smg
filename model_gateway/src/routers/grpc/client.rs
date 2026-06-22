@@ -8,11 +8,16 @@ use openai_protocol::{
 };
 use smg_grpc_client::{
     common_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle, MlxEngineClient,
-    SglangSchedulerClient, TokenSpeedSchedulerClient, TrtllmServiceClient, VllmEngineClient,
+    SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
+    TrtllmServiceClient, VllmEngineClient,
 };
 
 use crate::routers::grpc::{
-    proto_wrapper::{ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest, ProtoStream},
+    proto_wrapper::{
+        cleanup_tokenspeed_shm_handles, collect_tokenspeed_generate_request_shm_handles,
+        finish_tokenspeed_request, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
+        ProtoStream,
+    },
     MultimodalData,
 };
 
@@ -39,6 +44,13 @@ pub enum GrpcClient {
     Trtllm(TrtllmServiceClient),
     Mlx(MlxEngineClient),
     TokenSpeed(TokenSpeedSchedulerClient),
+}
+
+#[derive(Default)]
+pub struct GenerateRequestBuildOptions {
+    pub multimodal_inputs: Option<MultimodalData>,
+    pub tool_constraints: Option<(String, String)>,
+    pub require_reasoning: bool,
 }
 
 impl GrpcClient {
@@ -244,17 +256,26 @@ impl GrpcClient {
     /// Get the full load response from the backend.
     /// Returns `Unimplemented` for backends without scheduler load metrics.
     pub async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
+        // Optional sections beyond `core` (disagg/queues/memory) are dropped by
+        // engines that do not report them, so requesting them is always safe and
+        // leaves routing consumers, which only read `core`, unaffected.
+        let include = || {
+            ["core", "disagg", "queues", "memory"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
         match self {
             Self::Sglang(client) => {
-                let resp = client.get_loads(vec!["core".to_string()]).await?;
+                let resp = client.get_loads(include()).await?;
                 Ok(WorkerLoadResponse::from(resp))
             }
             Self::TokenSpeed(client) => {
-                let resp = client.get_loads(vec!["core".to_string()]).await?;
+                let resp = client.get_loads(include()).await?;
                 Ok(WorkerLoadResponse::from(resp))
             }
             Self::Vllm(client) => {
-                let resp = client.get_loads(vec!["core".to_string()]).await?;
+                let resp = client.get_loads(include()).await?;
                 Ok(WorkerLoadResponse::from(resp))
             }
             _ => Err(tonic::Status::unimplemented(
@@ -388,8 +409,14 @@ impl GrpcClient {
                 Ok(ProtoStream::Mlx(stream))
             }
             (Self::TokenSpeed(client), ProtoGenerateRequest::TokenSpeed(boxed_req)) => {
-                let stream = client.generate(*boxed_req).await?;
-                Ok(ProtoStream::TokenSpeed(stream))
+                let shm_handles = collect_tokenspeed_generate_request_shm_handles(&boxed_req);
+                match client.generate(*boxed_req).await {
+                    Ok(stream) => Ok(ProtoStream::TokenSpeed(stream)),
+                    Err(error) => {
+                        cleanup_tokenspeed_shm_handles(&shm_handles);
+                        Err(error)
+                    }
+                }
             }
             #[expect(
                 clippy::panic,
@@ -436,12 +463,11 @@ impl GrpcClient {
         body: &ChatCompletionRequest,
         processed_text: String,
         token_ids: Vec<u32>,
-        multimodal_inputs: Option<MultimodalData>,
-        tool_constraints: Option<(String, String)>,
+        options: GenerateRequestBuildOptions,
     ) -> Result<ProtoGenerateRequest, String> {
         match self {
             Self::Sglang(client) => {
-                let sglang_mm = multimodal_inputs.map(|mm| match mm {
+                let sglang_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::Sglang(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
@@ -450,13 +476,16 @@ impl GrpcClient {
                     body,
                     processed_text,
                     token_ids,
-                    sglang_mm,
-                    tool_constraints,
+                    SglangGenerateRequestOptions {
+                        multimodal_inputs: sglang_mm,
+                        tool_call_constraint: options.tool_constraints,
+                        require_reasoning: options.require_reasoning,
+                    },
                 )?;
                 Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
             }
             Self::Vllm(client) => {
-                let vllm_mm = multimodal_inputs.map(|mm| match mm {
+                let vllm_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::Vllm(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
@@ -466,12 +495,12 @@ impl GrpcClient {
                     processed_text,
                     token_ids,
                     vllm_mm,
-                    tool_constraints,
+                    options.tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::Vllm(Box::new(req)))
             }
             Self::Trtllm(client) => {
-                let trtllm_mm = multimodal_inputs.map(|mm| match mm {
+                let trtllm_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::Trtllm(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
@@ -481,7 +510,7 @@ impl GrpcClient {
                     processed_text,
                     token_ids,
                     trtllm_mm,
-                    tool_constraints,
+                    options.tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::Trtllm(Box::new(req)))
             }
@@ -492,24 +521,25 @@ impl GrpcClient {
                     body,
                     processed_text,
                     token_ids,
-                    tool_constraints,
+                    options.tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::Mlx(Box::new(req)))
             }
             Self::TokenSpeed(client) => {
-                let tokenspeed_mm = multimodal_inputs.map(|mm| match mm {
+                let tokenspeed_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::TokenSpeed(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
-                let req = client.build_generate_request_from_chat(
-                    request_id,
-                    body,
-                    processed_text,
-                    token_ids,
-                    tokenspeed_mm,
-                    tool_constraints,
-                )?;
-                Ok(ProtoGenerateRequest::TokenSpeed(Box::new(req)))
+                finish_tokenspeed_request(tokenspeed_mm, |mm| {
+                    client.build_generate_request_from_chat(
+                        request_id,
+                        body,
+                        processed_text,
+                        token_ids,
+                        mm,
+                        options.tool_constraints,
+                    )
+                })
             }
         }
     }
@@ -524,12 +554,11 @@ impl GrpcClient {
         body: &CreateMessageRequest,
         processed_text: String,
         token_ids: Vec<u32>,
-        multimodal_inputs: Option<MultimodalData>,
-        tool_constraints: Option<(String, String)>,
+        options: GenerateRequestBuildOptions,
     ) -> Result<ProtoGenerateRequest, String> {
         match self {
             Self::Sglang(client) => {
-                let sglang_mm = multimodal_inputs.map(|mm| match mm {
+                let sglang_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::Sglang(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
@@ -538,13 +567,16 @@ impl GrpcClient {
                     body,
                     processed_text,
                     token_ids,
-                    sglang_mm,
-                    tool_constraints,
+                    SglangGenerateRequestOptions {
+                        multimodal_inputs: sglang_mm,
+                        tool_call_constraint: options.tool_constraints,
+                        require_reasoning: options.require_reasoning,
+                    },
                 )?;
                 Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
             }
             Self::Vllm(client) => {
-                let vllm_mm = multimodal_inputs.map(|mm| match mm {
+                let vllm_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::Vllm(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
@@ -554,12 +586,12 @@ impl GrpcClient {
                     processed_text,
                     token_ids,
                     vllm_mm,
-                    tool_constraints,
+                    options.tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::Vllm(Box::new(req)))
             }
             Self::Trtllm(client) => {
-                let trtllm_mm = multimodal_inputs.map(|mm| match mm {
+                let trtllm_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::Trtllm(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
@@ -569,7 +601,7 @@ impl GrpcClient {
                     processed_text,
                     token_ids,
                     trtllm_mm,
-                    tool_constraints,
+                    options.tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::Trtllm(Box::new(req)))
             }
@@ -580,24 +612,25 @@ impl GrpcClient {
                     body,
                     processed_text,
                     token_ids,
-                    tool_constraints,
+                    options.tool_constraints,
                 )?;
                 Ok(ProtoGenerateRequest::Mlx(Box::new(req)))
             }
             Self::TokenSpeed(client) => {
-                let tokenspeed_mm = multimodal_inputs.map(|mm| match mm {
+                let tokenspeed_mm = options.multimodal_inputs.map(|mm| match mm {
                     MultimodalData::TokenSpeed(data) => data.into_proto(),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
-                let req = client.build_generate_request_from_messages(
-                    request_id,
-                    body,
-                    processed_text,
-                    token_ids,
-                    tokenspeed_mm,
-                    tool_constraints,
-                )?;
-                Ok(ProtoGenerateRequest::TokenSpeed(Box::new(req)))
+                finish_tokenspeed_request(tokenspeed_mm, |mm| {
+                    client.build_generate_request_from_messages(
+                        request_id,
+                        body,
+                        processed_text,
+                        token_ids,
+                        mm,
+                        options.tool_constraints,
+                    )
+                })
             }
         }
     }
@@ -772,6 +805,13 @@ impl ServerInfo {
                 }
                 if !info.tokenspeed_version.is_empty() {
                     labels.insert("version".to_string(), info.tokenspeed_version.clone());
+                }
+                // Carry the worker's /dev/shm namespace identity (advertised in
+                // scheduler_info). The router compares it to its own to decide the
+                // SHM tensor transport by *verifying* a shared /dev/shm rather than
+                // inferring it from the worker URL. See `worker_shares_dev_shm`.
+                if let Some(ref sched) = info.scheduler_info {
+                    pick_prost_fields(&mut labels, sched, &["shm_namespace_id"]);
                 }
                 labels
             }
